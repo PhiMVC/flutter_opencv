@@ -212,8 +212,11 @@ class _CameraHomeState extends State<CameraHome> {
       try {
         final (gradX, gradY) = _computeGradients(mat);
         double angleDeg;
+        double tiltVerticalDeg;
         try {
           angleDeg = _dominantAngleDegrees(gradX, gradY);
+          tiltVerticalDeg =
+              _verticalTiltDegrees(gradX, gradY, image.width, image.height);
         } finally {
           gradX.dispose();
           gradY.dispose();
@@ -227,6 +230,7 @@ class _CameraHomeState extends State<CameraHome> {
             mean: mean.val1,
             stddev: stddev.val1,
             angleDeg: angleDeg,
+            tiltVerticalDeg: tiltVerticalDeg,
             shakeRaw: shakeRaw,
           );
         });
@@ -268,6 +272,45 @@ class _CameraHomeState extends State<CameraHome> {
 
     final angleRad = 0.5 * math.atan2(2 * sumXY, sumXX - sumYY);
     return angleRad * 180 / math.pi;
+  }
+
+  double _verticalTiltDegrees(
+    cv.Mat gradX,
+    cv.Mat gradY,
+    int width,
+    int height,
+  ) {
+    if (width <= 0 || height <= 0) {
+      return 0;
+    }
+
+    final gx = _matToFloat32(gradX);
+    final gy = _matToFloat32(gradY);
+    final length = gx.length < gy.length ? gx.length : gy.length;
+    final total = width * height;
+    final usable = length < total ? length : total;
+    final half = height ~/ 2;
+
+    const sampleStep = 4;
+    double top = 0;
+    double bottom = 0;
+    for (var i = 0; i < usable; i += sampleStep) {
+      final mag = gx[i].abs() + gy[i].abs();
+      final y = i ~/ width;
+      if (y < half) {
+        top += mag;
+      } else {
+        bottom += mag;
+      }
+    }
+
+    final denom = top + bottom;
+    if (denom == 0) {
+      return 0;
+    }
+
+    final imbalance = (bottom - top) / denom;
+    return imbalance * 30;
   }
 
   Float32List _matToFloat32(cv.Mat mat) {
@@ -357,6 +400,7 @@ class Metrics {
   const Metrics({
     required this.sharpness,
     required this.angle,
+    required this.tiltVertical,
     required this.brightness,
     required this.shake,
     required this.distance,
@@ -364,6 +408,7 @@ class Metrics {
 
   final double sharpness;
   final double angle;
+  final double tiltVertical;
   final double brightness;
   final double shake;
   final double distance;
@@ -372,6 +417,7 @@ class Metrics {
     return const Metrics(
       sharpness: 72,
       angle: 3,
+      tiltVertical: 0,
       brightness: 64,
       shake: 0.8,
       distance: 1.2,
@@ -382,11 +428,13 @@ class Metrics {
     required double mean,
     required double stddev,
     required double angleDeg,
+    required double tiltVerticalDeg,
     required double shakeRaw,
   }) {
     final brightnessTarget = _mapToPercent(mean, 0, 255);
     final sharpnessTarget = _mapToPercent(stddev, 0, 64);
     final angleTarget = _clamp(angleDeg, -45, 45);
+    final tiltVerticalTarget = _clamp(tiltVerticalDeg, -30, 30);
     final shakeTarget = _mapToPercent(shakeRaw, 0, 30) / 100 * 5;
     final distanceTarget =
         _mapRange(100 - sharpnessTarget, 0, 100, 0.2, 3.5);
@@ -394,6 +442,7 @@ class Metrics {
     return Metrics(
       sharpness: _smooth(sharpness, sharpnessTarget, 0.25),
       angle: _smooth(angle, angleTarget, 0.2),
+      tiltVertical: _smooth(tiltVertical, tiltVerticalTarget, 0.2),
       brightness: _smooth(brightness, brightnessTarget, 0.25),
       shake: _smooth(shake, _clamp(shakeTarget, 0, 5), 0.25),
       distance: _smooth(
@@ -474,8 +523,12 @@ class MetricsPanel extends StatelessWidget {
             value: '${metrics.sharpness.toStringAsFixed(0)}%',
           ),
           MetricRow(
-            label: 'Góc',
+            label: 'Nghiêng ngang',
             value: '${metrics.angle.toStringAsFixed(1)} deg',
+          ),
+          MetricRow(
+            label: 'Nghiêng dọc',
+            value: '${metrics.tiltVertical.toStringAsFixed(1)} deg',
           ),
           MetricRow(
             label: 'Sáng',
