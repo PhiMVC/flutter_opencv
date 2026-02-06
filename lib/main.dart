@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
@@ -93,6 +94,7 @@ class _CameraHomeState extends State<CameraHome> {
   String? _error;
   bool _isStreaming = false;
   DateTime _lastMetricsUpdate = DateTime.fromMillisecondsSinceEpoch(0);
+  Uint8List? _prevLuma;
 
   @override
   void initState() {
@@ -208,8 +210,25 @@ class _CameraHomeState extends State<CameraHome> {
     try {
       final (mean, stddev) = cv.meanStdDev(mat);
       try {
+        final (gradX, gradY) = _computeGradients(mat);
+        double angleDeg;
+        try {
+          angleDeg = _dominantAngleDegrees(gradX, gradY);
+        } finally {
+          gradX.dispose();
+          gradY.dispose();
+        }
+
+        final shakeRaw = _frameDifference(packed, _prevLuma);
+        _prevLuma = Uint8List.fromList(packed);
+
         setState(() {
-          _metrics = _metrics.withStats(mean.val1, stddev.val1);
+          _metrics = _metrics.withStats(
+            mean: mean.val1,
+            stddev: stddev.val1,
+            angleDeg: angleDeg,
+            shakeRaw: shakeRaw,
+          );
         });
       } finally {
         mean.dispose();
@@ -218,6 +237,61 @@ class _CameraHomeState extends State<CameraHome> {
     } finally {
       mat.dispose();
     }
+  }
+
+  (cv.Mat, cv.Mat) _computeGradients(cv.Mat src) {
+    final gradX = cv.sobel(src, cv.MatType.CV_32F, 1, 0, ksize: 3);
+    final gradY = cv.sobel(src, cv.MatType.CV_32F, 0, 1, ksize: 3);
+    return (gradX, gradY);
+  }
+
+  double _dominantAngleDegrees(cv.Mat gradX, cv.Mat gradY) {
+    final gx = _matToFloat32(gradX);
+    final gy = _matToFloat32(gradY);
+    final length = gx.length < gy.length ? gx.length : gy.length;
+
+    const sampleStep = 4;
+    double sumXX = 0;
+    double sumYY = 0;
+    double sumXY = 0;
+    for (var i = 0; i < length; i += sampleStep) {
+      final dx = gx[i];
+      final dy = gy[i];
+      sumXX += dx * dx;
+      sumYY += dy * dy;
+      sumXY += dx * dy;
+    }
+
+    if (sumXX + sumYY == 0) {
+      return 0;
+    }
+
+    final angleRad = 0.5 * math.atan2(2 * sumXY, sumXX - sumYY);
+    return angleRad * 180 / math.pi;
+  }
+
+  Float32List _matToFloat32(cv.Mat mat) {
+    final data = mat.data;
+    final length = mat.total * mat.channels;
+    return Float32List.view(data.buffer, data.offsetInBytes, length);
+  }
+
+  double _frameDifference(Uint8List current, Uint8List? prev) {
+    if (prev == null || prev.length != current.length) {
+      return 0;
+    }
+
+    const sampleStep = 4;
+    var sum = 0;
+    var count = 0;
+    for (var i = 0; i < current.length; i += sampleStep) {
+      sum += (current[i] - prev[i]).abs();
+      count++;
+    }
+    if (count == 0) {
+      return 0;
+    }
+    return sum / count;
   }
 
   Uint8List _packLumaPlane(
@@ -304,17 +378,44 @@ class Metrics {
     );
   }
 
-  Metrics withStats(double mean, double stddev) {
+  Metrics withStats({
+    required double mean,
+    required double stddev,
+    required double angleDeg,
+    required double shakeRaw,
+  }) {
     final brightnessTarget = _mapToPercent(mean, 0, 255);
     final sharpnessTarget = _mapToPercent(stddev, 0, 64);
+    final angleTarget = _clamp(angleDeg, -45, 45);
+    final shakeTarget = _mapToPercent(shakeRaw, 0, 30) / 100 * 5;
+    final distanceTarget =
+        _mapRange(100 - sharpnessTarget, 0, 100, 0.2, 3.5);
 
     return Metrics(
       sharpness: _smooth(sharpness, sharpnessTarget, 0.25),
-      angle: _clamp(angle, -45, 45),
+      angle: _smooth(angle, angleTarget, 0.2),
       brightness: _smooth(brightness, brightnessTarget, 0.25),
-      shake: _clamp(shake, 0, 5),
-      distance: _clamp(distance, 0.2, 3.5),
+      shake: _smooth(shake, _clamp(shakeTarget, 0, 5), 0.25),
+      distance: _smooth(
+        distance,
+        _clamp(distanceTarget, 0.2, 3.5),
+        0.2,
+      ),
     );
+  }
+
+  double _mapRange(
+    double value,
+    double inMin,
+    double inMax,
+    double outMin,
+    double outMax,
+  ) {
+    if (inMax <= inMin) {
+      return outMin;
+    }
+    final t = _clamp((value - inMin) / (inMax - inMin), 0, 1);
+    return outMin + (outMax - outMin) * t;
   }
 
   double _mapToPercent(double value, double min, double max) {
