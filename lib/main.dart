@@ -1,11 +1,8 @@
-import 'dart:ffi' as ffi;
-import 'dart:math';
-
-import 'package:ffi/ffi.dart';
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_opencv/mylib_ffi.dart';
+import 'package:opencv_dart/opencv_dart.dart' as cv;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -27,7 +24,9 @@ class _CameraDemoAppState extends State<CameraDemoApp> {
   @override
   void initState() {
     super.initState();
-    _loadCameras();
+    if (_cameras.isEmpty) {
+      _loadCameras();
+    }
   }
 
   Future<void> _loadCameras() async {
@@ -94,13 +93,10 @@ class _CameraHomeState extends State<CameraHome> {
   String? _error;
   bool _isStreaming = false;
   DateTime _lastMetricsUpdate = DateTime.fromMillisecondsSinceEpoch(0);
-  final Random _rng = Random();
-  MyLib? _lib;
 
   @override
   void initState() {
     super.initState();
-    _initNative();
     _initializeCamera();
   }
 
@@ -185,7 +181,8 @@ class _CameraHomeState extends State<CameraHome> {
 
   void _onImage(CameraImage image) {
     final now = DateTime.now();
-    if (now.difference(_lastMetricsUpdate) < const Duration(milliseconds: 120)) {
+    if (now.difference(_lastMetricsUpdate) <
+        const Duration(milliseconds: 120)) {
       return;
     }
     _lastMetricsUpdate = now;
@@ -194,42 +191,53 @@ class _CameraHomeState extends State<CameraHome> {
       return;
     }
 
-    final lib = _lib;
-    if (lib == null) {
-      setState(() {
-        _metrics = _metrics.jitter(_rng);
-      });
-      return;
-    }
-
     final yPlane = image.planes[0];
-    final bytes = yPlane.bytes;
+    final packed = _packLumaPlane(
+      yPlane.bytes,
+      image.width,
+      image.height,
+      yPlane.bytesPerRow,
+    );
 
-    final ptr = malloc<ffi.Uint8>(bytes.length);
+    final mat = cv.Mat.fromList(
+      image.height,
+      image.width,
+      cv.MatType.CV_8UC1,
+      packed,
+    );
     try {
-      ptr.asTypedList(bytes.length).setAll(0, bytes);
-
-      final res = lib.processGray(
-        ptr,
-        image.width,
-        image.height,
-        yPlane.bytesPerRow,
-      );
-
-      setState(() {
-        _metrics = _metrics.withNative(res, _rng);
-      });
+      final (mean, stddev) = cv.meanStdDev(mat);
+      try {
+        setState(() {
+          _metrics = _metrics.withStats(mean.val1, stddev.val1);
+        });
+      } finally {
+        mean.dispose();
+        stddev.dispose();
+      }
     } finally {
-      malloc.free(ptr);
+      mat.dispose();
     }
   }
 
-  void _initNative() {
-    try {
-      _lib = MyLib();
-    } catch (_) {
-      _lib = null;
+  Uint8List _packLumaPlane(
+    Uint8List bytes,
+    int width,
+    int height,
+    int rowStride,
+  ) {
+    if (rowStride == width) {
+      return bytes;
     }
+
+    final packed = Uint8List(width * height);
+    var dst = 0;
+    for (var y = 0; y < height; y++) {
+      final srcStart = y * rowStride;
+      packed.setRange(dst, dst + width, bytes, srcStart);
+      dst += width;
+    }
+    return packed;
   }
 
   @override
@@ -296,31 +304,17 @@ class Metrics {
     );
   }
 
-  Metrics withNative(Result native, Random rng) {
-    final brightnessTarget = _mapToPercent(native.a, 0, 255);
-    final sharpnessTarget = _mapToPercent(native.b, 0, 64);
+  Metrics withStats(double mean, double stddev) {
+    final brightnessTarget = _mapToPercent(mean, 0, 255);
+    final sharpnessTarget = _mapToPercent(stddev, 0, 64);
 
     return Metrics(
       sharpness: _smooth(sharpness, sharpnessTarget, 0.25),
-      angle: _clamp(angle + _delta(rng, 1.8), -45, 45),
+      angle: _clamp(angle, -45, 45),
       brightness: _smooth(brightness, brightnessTarget, 0.25),
-      shake: _clamp(shake + _delta(rng, 0.2), 0, 5),
-      distance: _clamp(distance + _delta(rng, 0.06), 0.2, 3.5),
+      shake: _clamp(shake, 0, 5),
+      distance: _clamp(distance, 0.2, 3.5),
     );
-  }
-
-  Metrics jitter(Random rng) {
-    return Metrics(
-      sharpness: _clamp(sharpness + _delta(rng, 3), 0, 100),
-      angle: _clamp(angle + _delta(rng, 1.8), -45, 45),
-      brightness: _clamp(brightness + _delta(rng, 2.5), 0, 100),
-      shake: _clamp(shake + _delta(rng, 0.2), 0, 5),
-      distance: _clamp(distance + _delta(rng, 0.06), 0.2, 3.5),
-    );
-  }
-
-  double _delta(Random rng, double magnitude) {
-    return (rng.nextDouble() * 2 - 1) * magnitude;
   }
 
   double _mapToPercent(double value, double min, double max) {
