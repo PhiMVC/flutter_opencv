@@ -215,8 +215,12 @@ class _CameraHomeState extends State<CameraHome> {
         double tiltVerticalDeg;
         try {
           angleDeg = _dominantAngleDegrees(gradX, gradY);
-          tiltVerticalDeg =
-              _verticalTiltDegrees(gradX, gradY, image.width, image.height);
+          tiltVerticalDeg = _verticalTiltDegrees(
+            gradX,
+            gradY,
+            image.width,
+            image.height,
+          );
         } finally {
           gradX.dispose();
           gradY.dispose();
@@ -381,14 +385,10 @@ class _CameraHomeState extends State<CameraHome> {
         children: [
           Positioned.fill(child: CameraPreview(controller)),
           Positioned(
-            left: 16,
-            top: 16,
-            child: SafeArea(child: MetricsPanel(metrics: _metrics)),
-          ),
-          Positioned(
-            right: 16,
-            top: 16,
-            child: SafeArea(child: StreamBadge(isStreaming: _isStreaming)),
+            left: 12,
+            right: 12,
+            bottom: 12,
+            child: SafeArea(top: false, child: MetricsPanel(metrics: _metrics)),
           ),
         ],
       ),
@@ -401,26 +401,69 @@ class Metrics {
     required this.sharpness,
     required this.angle,
     required this.tiltVertical,
+    required this.frontal,
     required this.brightness,
     required this.shake,
     required this.distance,
+    required this.isSharpnessOk,
+    required this.isAngleOk,
+    required this.isTiltVerticalOk,
+    required this.isFrontalOk,
+    required this.isBrightnessOk,
+    required this.isShakeOk,
+    required this.isDistanceOk,
   });
 
   final double sharpness;
   final double angle;
   final double tiltVertical;
+  final double frontal;
   final double brightness;
   final double shake;
   final double distance;
+  final bool isSharpnessOk;
+  final bool isAngleOk;
+  final bool isTiltVerticalOk;
+  final bool isFrontalOk;
+  final bool isBrightnessOk;
+  final bool isShakeOk;
+  final bool isDistanceOk;
+
+  bool get isCaptureReady =>
+      isSharpnessOk &&
+      isAngleOk &&
+      isTiltVerticalOk &&
+      isFrontalOk &&
+      isBrightnessOk &&
+      isShakeOk &&
+      isDistanceOk;
+
+  static const double _sharpnessMin = 60;
+  static const double _angleMax = 5;
+  static const double _tiltVerticalMax = 5;
+  static const double _frontalMin = 80;
+  static const double _brightnessMin = 30;
+  static const double _brightnessMax = 85;
+  static const double _shakeMax = 1.5;
+  static const double _distanceMin = 0.5;
+  static const double _distanceMax = 2.0;
 
   static Metrics initial() {
     return const Metrics(
       sharpness: 72,
       angle: 3,
       tiltVertical: 0,
+      frontal: 88,
       brightness: 64,
       shake: 0.8,
       distance: 1.2,
+      isSharpnessOk: true,
+      isAngleOk: true,
+      isTiltVerticalOk: true,
+      isFrontalOk: true,
+      isBrightnessOk: true,
+      isShakeOk: true,
+      isDistanceOk: true,
     );
   }
 
@@ -435,21 +478,39 @@ class Metrics {
     final sharpnessTarget = _mapToPercent(stddev, 0, 64);
     final angleTarget = _clamp(angleDeg, -45, 45);
     final tiltVerticalTarget = _clamp(tiltVerticalDeg, -30, 30);
+    final frontalTarget = _frontalScore(angleDeg, tiltVerticalDeg);
     final shakeTarget = _mapToPercent(shakeRaw, 0, 30) / 100 * 5;
-    final distanceTarget =
-        _mapRange(100 - sharpnessTarget, 0, 100, 0.2, 3.5);
+    final distanceTarget = _mapRange(100 - sharpnessTarget, 0, 100, 0.2, 3.5);
+
+    final nextSharpness = _smooth(sharpness, sharpnessTarget, 0.25);
+    final nextAngle = _smooth(angle, angleTarget, 0.2);
+    final nextTiltVertical = _smooth(tiltVertical, tiltVerticalTarget, 0.2);
+    final nextFrontal = _smooth(frontal, frontalTarget, 0.2);
+    final nextBrightness = _smooth(brightness, brightnessTarget, 0.25);
+    final nextShake = _smooth(shake, _clamp(shakeTarget, 0, 5), 0.25);
+    final nextDistance = _smooth(
+      distance,
+      _clamp(distanceTarget, 0.2, 3.5),
+      0.2,
+    );
 
     return Metrics(
-      sharpness: _smooth(sharpness, sharpnessTarget, 0.25),
-      angle: _smooth(angle, angleTarget, 0.2),
-      tiltVertical: _smooth(tiltVertical, tiltVerticalTarget, 0.2),
-      brightness: _smooth(brightness, brightnessTarget, 0.25),
-      shake: _smooth(shake, _clamp(shakeTarget, 0, 5), 0.25),
-      distance: _smooth(
-        distance,
-        _clamp(distanceTarget, 0.2, 3.5),
-        0.2,
-      ),
+      sharpness: nextSharpness,
+      angle: nextAngle,
+      tiltVertical: nextTiltVertical,
+      frontal: nextFrontal,
+      brightness: nextBrightness,
+      shake: nextShake,
+      distance: nextDistance,
+      isSharpnessOk: nextSharpness >= _sharpnessMin,
+      isAngleOk: nextAngle.abs() <= _angleMax,
+      isTiltVerticalOk: nextTiltVertical.abs() <= _tiltVerticalMax,
+      isFrontalOk: nextFrontal >= _frontalMin,
+      isBrightnessOk:
+          nextBrightness >= _brightnessMin && nextBrightness <= _brightnessMax,
+      isShakeOk: nextShake <= _shakeMax,
+      isDistanceOk:
+          nextDistance >= _distanceMin && nextDistance <= _distanceMax,
     );
   }
 
@@ -475,6 +536,15 @@ class Metrics {
     return ((clamped - min) / (max - min)) * 100;
   }
 
+  double _frontalScore(double angleDeg, double tiltVerticalDeg) {
+    const maxAngle = 45.0;
+    const maxTilt = 30.0;
+    final angleRatio = (angleDeg.abs() / maxAngle);
+    final tiltRatio = (tiltVerticalDeg.abs() / maxTilt);
+    final normalized = _clamp((angleRatio + tiltRatio) / 2, 0, 1);
+    return (1 - normalized) * 100;
+  }
+
   double _smooth(double current, double target, double alpha) {
     return current + (target - current) * alpha;
   }
@@ -498,123 +568,143 @@ class MetricsPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 200,
-      padding: const EdgeInsets.all(12),
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
         color: Colors.black.withValues(alpha: 0.45),
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            'Realtime Metrics',
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 14,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 0.2,
+      child: Builder(
+        builder: (context) {
+          final items = <Widget>[
+            MetricRow(
+              label: 'Nét',
+              value: '${metrics.sharpness.toStringAsFixed(0)}%',
+              isValid: metrics.isSharpnessOk,
             ),
-          ),
-          const SizedBox(height: 10),
-          MetricRow(
-            label: 'Nét',
-            value: '${metrics.sharpness.toStringAsFixed(0)}%',
-          ),
-          MetricRow(
-            label: 'Nghiêng ngang',
-            value: '${metrics.angle.toStringAsFixed(1)} deg',
-          ),
-          MetricRow(
-            label: 'Nghiêng dọc',
-            value: '${metrics.tiltVertical.toStringAsFixed(1)} deg',
-          ),
-          MetricRow(
-            label: 'Sáng',
-            value: '${metrics.brightness.toStringAsFixed(0)}%',
-          ),
-          MetricRow(label: 'Rung', value: metrics.shake.toStringAsFixed(2)),
-          MetricRow(
-            label: 'Cách',
-            value: '${metrics.distance.toStringAsFixed(2)} m',
-          ),
-        ],
+            MetricRow(
+              label: 'Ngang',
+              value: '${metrics.angle.toStringAsFixed(1)} deg',
+              isValid: metrics.isAngleOk,
+            ),
+            MetricRow(
+              label: 'Dọc',
+              value: '${metrics.tiltVertical.toStringAsFixed(1)} deg',
+              isValid: metrics.isTiltVerticalOk,
+            ),
+            MetricRow(
+              label: 'Thẳng',
+              value: '${metrics.frontal.toStringAsFixed(0)}%',
+              isValid: metrics.isFrontalOk,
+            ),
+            MetricRow(
+              label: 'Sáng',
+              value: '${metrics.brightness.toStringAsFixed(0)}%',
+              isValid: metrics.isBrightnessOk,
+            ),
+            MetricRow(
+              label: 'Rung',
+              value: metrics.shake.toStringAsFixed(2),
+              isValid: metrics.isShakeOk,
+            ),
+            MetricRow(
+              label: 'Cách',
+              value: '${metrics.distance.toStringAsFixed(2)} m',
+              isValid: metrics.isDistanceOk,
+            ),
+          ];
+
+          final firstRow = items.take(4).toList();
+          final secondRow = items.skip(4).toList();
+          while (secondRow.length < 4) {
+            secondRow.add(const _MetricPlaceholder());
+          }
+
+          Widget cell(Widget child) {
+            return Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 3),
+                child: child,
+              ),
+            );
+          }
+
+          return Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Row(children: firstRow.map(cell).toList()),
+              const SizedBox(height: 8),
+              Row(children: secondRow.map(cell).toList()),
+            ],
+          );
+        },
       ),
     );
   }
 }
 
 class MetricRow extends StatelessWidget {
-  const MetricRow({super.key, required this.label, required this.value});
+  const MetricRow({
+    super.key,
+    required this.label,
+    required this.value,
+    required this.isValid,
+  });
 
   final String label;
   final String value;
+  final bool isValid;
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 3),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(
-            label,
-            style: TextStyle(
-              color: Colors.white.withValues(alpha: 0.85),
-              fontSize: 13,
+    final statusColor = isValid ? Colors.greenAccent : Colors.redAccent;
+    return SizedBox(
+      height: _metricItemHeight,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: statusColor.withValues(alpha: 0.8)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: Colors.white.withValues(alpha: 0.8),
+                fontSize: 11,
+              ),
             ),
-          ),
-          Text(
-            value,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
+            const SizedBox(height: 4),
+            Text(
+              value,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 }
 
-class StreamBadge extends StatelessWidget {
-  const StreamBadge({super.key, required this.isStreaming});
+const double _metricItemHeight = 60;
 
-  final bool isStreaming;
+class _MetricPlaceholder extends StatelessWidget {
+  const _MetricPlaceholder();
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.45),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 8,
-            height: 8,
-            decoration: BoxDecoration(
-              color: isStreaming ? Colors.greenAccent : Colors.redAccent,
-              shape: BoxShape.circle,
-            ),
-          ),
-          const SizedBox(width: 6),
-          Text(
-            isStreaming ? 'Stream ON' : 'Stream OFF',
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ],
-      ),
-    );
+    return const SizedBox(height: _metricItemHeight);
   }
 }
