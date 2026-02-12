@@ -97,8 +97,8 @@ class _CameraHomeState extends State<CameraHome> {
   static const Duration _inferenceInterval = Duration(milliseconds: 260);
   static const int _metricsMaxDim = 360;
   static const double _scoreThreshold = 0.2;
-  static const double _nmsThreshold = 0.45;
-  static const int _maxDetections = 20;
+  static const double _nmsThreshold = 0.9;
+  static const int _maxDetections = 100;
 
   CameraController? _controller;
   Metrics _metrics = Metrics.initial();

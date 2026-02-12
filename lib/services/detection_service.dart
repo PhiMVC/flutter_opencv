@@ -608,6 +608,13 @@ class DetectionService {
       return const [];
     }
 
+    final format = _detectYoloBoxFormatRows(
+      rows,
+      letterbox.inputWidth,
+      letterbox.inputHeight,
+    );
+    _log('YOLO box format: ${format == _YoloBoxFormat.xyxy ? "xyxy" : "xywh"}');
+
     final detections = <Detection>[];
     for (final row in rows) {
       final values = row as List;
@@ -649,17 +656,20 @@ class DetectionService {
       final normalized = x <= 1.5 && y <= 1.5 && w <= 1.5 && h <= 1.5;
       final scaleX = normalized ? letterbox.inputWidth : 1.0;
       final scaleY = normalized ? letterbox.inputHeight : 1.0;
-      final cx = x * scaleX;
-      final cy = y * scaleY;
-      final bw = w * scaleX;
-      final bh = h * scaleY;
-
-      final rectInput = Rect.fromLTRB(
-        cx - bw / 2,
-        cy - bh / 2,
-        cx + bw / 2,
-        cy + bh / 2,
-      );
+      final rectInput =
+          format == _YoloBoxFormat.xyxy
+              ? Rect.fromLTRB(
+                x * scaleX,
+                y * scaleY,
+                w * scaleX,
+                h * scaleY,
+              )
+              : Rect.fromLTRB(
+                x * scaleX - (w * scaleX) / 2,
+                y * scaleY - (h * scaleY) / 2,
+                x * scaleX + (w * scaleX) / 2,
+                y * scaleY + (h * scaleY) / 2,
+              );
       final rect = _mapToOriginal(rectInput, letterbox);
       detections.add(Detection(rect: rect, score: score, classId: classId));
     }
@@ -680,6 +690,13 @@ class DetectionService {
       return const [];
     }
     final count = firstRow.length;
+    final format = _detectYoloBoxFormatChannelFirst(
+      rows,
+      letterbox.inputWidth,
+      letterbox.inputHeight,
+    );
+    _log('YOLO box format: ${format == _YoloBoxFormat.xyxy ? "xyxy" : "xywh"}');
+
     final detections = <Detection>[];
 
     for (var i = 0; i < count; i++) {
@@ -718,22 +735,135 @@ class DetectionService {
       final normalized = x <= 1.5 && y <= 1.5 && w <= 1.5 && h <= 1.5;
       final scaleX = normalized ? letterbox.inputWidth : 1.0;
       final scaleY = normalized ? letterbox.inputHeight : 1.0;
-      final cx = x * scaleX;
-      final cy = y * scaleY;
-      final bw = w * scaleX;
-      final bh = h * scaleY;
-
-      final rectInput = Rect.fromLTRB(
-        cx - bw / 2,
-        cy - bh / 2,
-        cx + bw / 2,
-        cy + bh / 2,
-      );
+      final rectInput =
+          format == _YoloBoxFormat.xyxy
+              ? Rect.fromLTRB(
+                x * scaleX,
+                y * scaleY,
+                w * scaleX,
+                h * scaleY,
+              )
+              : Rect.fromLTRB(
+                x * scaleX - (w * scaleX) / 2,
+                y * scaleY - (h * scaleY) / 2,
+                x * scaleX + (w * scaleX) / 2,
+                y * scaleY + (h * scaleY) / 2,
+              );
       final rect = _mapToOriginal(rectInput, letterbox);
       detections.add(Detection(rect: rect, score: score, classId: classId));
     }
 
     return detections;
+  }
+
+  _YoloBoxFormat _detectYoloBoxFormatRows(
+    List rows,
+    int inputW,
+    int inputH,
+  ) {
+    var xyxyScore = 0;
+    var xywhScore = 0;
+    final sampleCount = math.min(rows.length, 20);
+    for (var i = 0; i < sampleCount; i++) {
+      final row = rows[i] as List;
+      if (row.length < 4) continue;
+      final x = (row[0] as num).toDouble();
+      final y = (row[1] as num).toDouble();
+      final a = (row[2] as num).toDouble();
+      final b = (row[3] as num).toDouble();
+      final normalized = x <= 1.5 && y <= 1.5 && a <= 1.5 && b <= 1.5;
+      final scaleX = normalized ? inputW : 1.0;
+      final scaleY = normalized ? inputH : 1.0;
+
+      final xyxyValid = _validBox(
+        x * scaleX,
+        y * scaleY,
+        a * scaleX,
+        b * scaleY,
+        inputW,
+        inputH,
+      );
+      if (xyxyValid) xyxyScore++;
+
+      final left = x * scaleX - (a * scaleX) / 2;
+      final top = y * scaleY - (b * scaleY) / 2;
+      final right = x * scaleX + (a * scaleX) / 2;
+      final bottom = y * scaleY + (b * scaleY) / 2;
+      final xywhValid = _validBox(left, top, right, bottom, inputW, inputH);
+      if (xywhValid) xywhScore++;
+    }
+    return xyxyScore >= xywhScore
+        ? _YoloBoxFormat.xyxy
+        : _YoloBoxFormat.xywh;
+  }
+
+  _YoloBoxFormat _detectYoloBoxFormatChannelFirst(
+    List rows,
+    int inputW,
+    int inputH,
+  ) {
+    if (rows.length < 4) {
+      return _YoloBoxFormat.xywh;
+    }
+    final firstRow = rows[0] as List;
+    if (firstRow.isEmpty) {
+      return _YoloBoxFormat.xywh;
+    }
+    var xyxyScore = 0;
+    var xywhScore = 0;
+    final sampleCount = math.min(firstRow.length, 20);
+    for (var i = 0; i < sampleCount; i++) {
+      final x = (rows[0][i] as num).toDouble();
+      final y = (rows[1][i] as num).toDouble();
+      final a = (rows[2][i] as num).toDouble();
+      final b = (rows[3][i] as num).toDouble();
+      final normalized = x <= 1.5 && y <= 1.5 && a <= 1.5 && b <= 1.5;
+      final scaleX = normalized ? inputW : 1.0;
+      final scaleY = normalized ? inputH : 1.0;
+
+      final xyxyValid = _validBox(
+        x * scaleX,
+        y * scaleY,
+        a * scaleX,
+        b * scaleY,
+        inputW,
+        inputH,
+      );
+      if (xyxyValid) xyxyScore++;
+
+      final left = x * scaleX - (a * scaleX) / 2;
+      final top = y * scaleY - (b * scaleY) / 2;
+      final right = x * scaleX + (a * scaleX) / 2;
+      final bottom = y * scaleY + (b * scaleY) / 2;
+      final xywhValid = _validBox(left, top, right, bottom, inputW, inputH);
+      if (xywhValid) xywhScore++;
+    }
+    return xyxyScore >= xywhScore
+        ? _YoloBoxFormat.xyxy
+        : _YoloBoxFormat.xywh;
+  }
+
+  bool _validBox(
+    double left,
+    double top,
+    double right,
+    double bottom,
+    int inputW,
+    int inputH,
+  ) {
+    if (left.isNaN || top.isNaN || right.isNaN || bottom.isNaN) {
+      return false;
+    }
+    if (right <= left || bottom <= top) {
+      return false;
+    }
+    if (right < 0 || bottom < 0) {
+      return false;
+    }
+    if (left > inputW * 2 || top > inputH * 2) {
+      return false;
+    }
+    return true;
   }
 
   Rect _mapToOriginal(Rect rect, _LetterboxInfo info) {
@@ -810,6 +940,9 @@ class DetectionService {
   }
 
   double _clampDouble(double value, double min, double max) {
+    if (value.isNaN || value.isInfinite) {
+      return min;
+    }
     if (value < min) {
       return min;
     }
@@ -839,3 +972,5 @@ class _LetterboxInfo {
   final int srcWidth;
   final int srcHeight;
 }
+
+enum _YoloBoxFormat { xywh, xyxy }
