@@ -571,16 +571,11 @@ class DetectionService {
     Map<int, Object> outputs,
     _LetterboxInfo letterbox,
   ) {
-    int? outputIdx;
-    for (var i = 0; i < _outputTensors.length; i++) {
-      if (_outputTensors[i].shape.length == 3) {
-        outputIdx = i;
-        break;
-      }
-    }
+    final outputIdx = _selectYoloOutputIndex();
     if (outputIdx == null) {
       return const [];
     }
+    _log('YOLO output index=$outputIdx shape=${_outputTensors[outputIdx].shape}');
 
     final output = outputs[outputIdx];
     if (output is! List || output.isEmpty) {
@@ -754,6 +749,39 @@ class DetectionService {
     }
 
     return detections;
+  }
+
+  int? _selectYoloOutputIndex() {
+    var bestScore = -1.0;
+    int? bestIdx;
+    for (var i = 0; i < _outputTensors.length; i++) {
+      final shape = _outputTensors[i].shape;
+      if (shape.length != 3) {
+        continue;
+      }
+      final score = _scoreYoloShape(shape);
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  double _scoreYoloShape(List<int> shape) {
+    if (shape.length != 3) {
+      return -1;
+    }
+    final a = shape[1];
+    final b = shape[2];
+    var score = -1.0;
+    if (b >= 5 && b <= 512 && a >= 10) {
+      score = math.max(score, a + b / 1000.0);
+    }
+    if (a >= 5 && a <= 512 && b >= 10) {
+      score = math.max(score, b + a / 1000.0);
+    }
+    return score;
   }
 
   _YoloBoxFormat _detectYoloBoxFormatRows(
