@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:opencv_dart/opencv_dart.dart' as cv;
 import 'package:tflite_flutter/tflite_flutter.dart';
 
@@ -27,6 +28,9 @@ class DetectionService {
     this.scoreThreshold = 0.4,
     this.nmsThreshold = 0.45,
     this.maxDetections = 20,
+    this.enableLogs = true,
+    this.logEveryN = 1,
+    this.logSampleSize = 8,
   });
 
   final String modelAsset;
@@ -34,6 +38,9 @@ class DetectionService {
   final double scoreThreshold;
   final double nmsThreshold;
   final int maxDetections;
+  final bool enableLogs;
+  final int logEveryN;
+  final int logSampleSize;
 
   Interpreter? _interpreter;
   IsolateInterpreter? _isolateInterpreter;
@@ -48,6 +55,8 @@ class DetectionService {
   Uint8List? _rgbBuffer;
   bool _isBusy = false;
   String? _modelError;
+  bool _loggedOutputSample = false;
+  int _inferenceCount = 0;
 
   bool get isBusy => _isBusy;
   bool get isReady =>
@@ -59,6 +68,7 @@ class DetectionService {
   String? get modelError => _modelError;
 
   Future<void> load() async {
+    _log('Loading model: $modelAsset');
     final options = InterpreterOptions()..threads = threads;
     final interpreter = await Interpreter.fromAsset(
       modelAsset,
@@ -75,6 +85,17 @@ class DetectionService {
     final inputShape = List<int>.from(inputTensor.shape);
     final (inputW, inputH, inputC) = _parseInputShape(inputShape);
     final outputTensors = _getOutputTensors(interpreter);
+    _log(
+      'Input tensor shape=$inputShape type=${inputTensor.type} '
+      'params=${_formatParams(inputTensor)}',
+    );
+    for (var i = 0; i < outputTensors.length; i++) {
+      final t = outputTensors[i];
+      _log(
+        'Output[$i] shape=${t.shape} type=${t.type} '
+        'params=${_formatParams(t)}',
+      );
+    }
 
     final previousIsolate = _isolateInterpreter;
     _isolateInterpreter = isolate;
@@ -89,6 +110,10 @@ class DetectionService {
     _inputBufferF32 = null;
     _inputBufferU8 = null;
     _modelError = inputC == 3 ? null : 'Model input expects $inputC channels';
+    _loggedOutputSample = false;
+    if (_modelError != null) {
+      _log('Model error: $_modelError');
+    }
 
     await previousIsolate?.close();
   }
@@ -124,7 +149,20 @@ class DetectionService {
 
       final outputBuffers = _outputBuffers;
       if (outputBuffers == null) {
+        _log('Output buffers not allocated.');
         return null;
+      }
+
+      _inferenceCount++;
+      if (_shouldLogSample()) {
+        _log(
+          'Run #$_inferenceCount input type=$_inputType '
+          'shape=[1,$inputH,$inputW,3] bytes=${inputBytes.length}',
+        );
+        final headSample = _sampleOutput(inputTensor, logSampleSize);
+        _log('Input head sample=${headSample.isEmpty ? "[]" : headSample}');
+        final centerSample = _sampleInputCenter(inputW, inputH, logSampleSize);
+        _log('Input center sample=${centerSample.isEmpty ? "[]" : centerSample}');
       }
 
       final isolate = _isolateInterpreter;
@@ -135,16 +173,22 @@ class DetectionService {
       }
 
       final detections = _parseDetections(outputBuffers, letterbox);
+      if (_shouldLogSample()) {
+        _loggedOutputSample = true;
+        for (var i = 0; i < _outputTensors.length; i++) {
+          final output = outputBuffers[i];
+          if (output == null) continue;
+          final sample = _sampleOutput(output, 8);
+          _log('Output[$i] sample=${sample.isEmpty ? "[]" : sample}');
+        }
+      }
       final elapsedMs = DateTime.now().difference(start).inMilliseconds;
       _modelError = null;
 
       return DetectionResult(
         detections: detections,
         inferenceMs: elapsedMs,
-        imageSize: Size(
-          image.width.toDouble(),
-          image.height.toDouble(),
-        ),
+        imageSize: Size(image.width.toDouble(), image.height.toDouble()),
       );
     } catch (e) {
       _modelError = 'Inference error: $e';
@@ -166,6 +210,72 @@ class DetectionService {
   Tensor _getInputTensor(Interpreter interpreter) {
     final dynamic dyn = interpreter;
     return dyn.getInputTensor(0) as Tensor;
+  }
+
+  void _log(String message) {
+    if (!enableLogs) return;
+    debugPrint('[DetectionService] $message');
+  }
+
+  String _formatParams(Tensor tensor) {
+    final params = tensor.params;
+    return 'scale=${params.scale}, zeroPoint=${params.zeroPoint}';
+  }
+
+  bool _shouldLogSample() {
+    if (!enableLogs) return false;
+    if (logEveryN <= 0) {
+      return !_loggedOutputSample;
+    }
+    return _inferenceCount % logEveryN == 0;
+  }
+
+  List<num> _sampleOutput(Object output, int maxCount) {
+    final result = <num>[];
+    void visit(dynamic value) {
+      if (result.length >= maxCount) return;
+      if (value is num) {
+        result.add(value);
+        return;
+      }
+      if (value is List) {
+        for (final entry in value) {
+          if (result.length >= maxCount) break;
+          visit(entry);
+        }
+      }
+    }
+
+    visit(output);
+    return result;
+  }
+
+  List<num> _sampleInputCenter(int inputW, int inputH, int maxCount) {
+    final channels = _inputChannels;
+    if (channels <= 0 || inputW <= 0 || inputH <= 0) {
+      return const [];
+    }
+    final centerOffset =
+        ((inputH ~/ 2) * inputW + (inputW ~/ 2)) * channels;
+    final inputType = _inputType;
+    if (inputType == TensorType.uint8) {
+      final buffer = _inputBufferU8;
+      return _sampleFlatBuffer(buffer, centerOffset, maxCount);
+    }
+    final buffer = _inputBufferF32;
+    return _sampleFlatBuffer(buffer, centerOffset, maxCount);
+  }
+
+  List<num> _sampleFlatBuffer(List<num>? buffer, int start, int maxCount) {
+    if (buffer == null || buffer.isEmpty || start < 0) {
+      return const [];
+    }
+    final result = <num>[];
+    final end = (start + maxCount).clamp(0, buffer.length);
+    for (var i = start; i < end; i++) {
+      result.add(buffer[i]);
+    }
+    return result;
   }
 
   List<Tensor> _getOutputTensors(Interpreter interpreter) {
@@ -483,6 +593,16 @@ class DetectionService {
     }
 
     final firstRow = rows[0] as List;
+    if (firstRow.isEmpty) {
+      return const [];
+    }
+
+    final isChannelFirst = rows.length < firstRow.length && rows.length <= 256;
+    if (isChannelFirst) {
+      _log('YOLO output detected as channel-first (C,N). Transposing.');
+      return _parseYoloChannelFirst(rows, letterbox);
+    }
+
     final cols = firstRow.length;
     if (cols < 5) {
       return const [];
@@ -519,6 +639,75 @@ class DetectionService {
         classId = (values[5] as num).round();
       } else {
         score = (values[4] as num).toDouble();
+        classId = 0;
+      }
+
+      if (score < scoreThreshold) {
+        continue;
+      }
+
+      final normalized = x <= 1.5 && y <= 1.5 && w <= 1.5 && h <= 1.5;
+      final scaleX = normalized ? letterbox.inputWidth : 1.0;
+      final scaleY = normalized ? letterbox.inputHeight : 1.0;
+      final cx = x * scaleX;
+      final cy = y * scaleY;
+      final bw = w * scaleX;
+      final bh = h * scaleY;
+
+      final rectInput = Rect.fromLTRB(
+        cx - bw / 2,
+        cy - bh / 2,
+        cx + bw / 2,
+        cy + bh / 2,
+      );
+      final rect = _mapToOriginal(rectInput, letterbox);
+      detections.add(Detection(rect: rect, score: score, classId: classId));
+    }
+
+    return detections;
+  }
+
+  List<Detection> _parseYoloChannelFirst(
+    List rows,
+    _LetterboxInfo letterbox,
+  ) {
+    final channels = rows.length;
+    if (channels < 5) {
+      return const [];
+    }
+    final firstRow = rows[0] as List;
+    if (firstRow.isEmpty) {
+      return const [];
+    }
+    final count = firstRow.length;
+    final detections = <Detection>[];
+
+    for (var i = 0; i < count; i++) {
+      final x = (rows[0][i] as num).toDouble();
+      final y = (rows[1][i] as num).toDouble();
+      final w = (rows[2][i] as num).toDouble();
+      final h = (rows[3][i] as num).toDouble();
+
+      double score;
+      int classId;
+      if (channels > 6) {
+        final objectness = (rows[4][i] as num).toDouble();
+        var maxClass = 0.0;
+        var maxIdx = 0;
+        for (var c = 5; c < channels; c++) {
+          final prob = (rows[c][i] as num).toDouble();
+          if (prob > maxClass) {
+            maxClass = prob;
+            maxIdx = c - 5;
+          }
+        }
+        score = objectness * maxClass;
+        classId = maxIdx;
+      } else if (channels == 6) {
+        score = (rows[4][i] as num).toDouble();
+        classId = (rows[5][i] as num).round();
+      } else {
+        score = (rows[4][i] as num).toDouble();
         classId = 0;
       }
 

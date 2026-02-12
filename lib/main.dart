@@ -94,11 +94,9 @@ class CameraHome extends StatefulWidget {
 }
 
 class _CameraHomeState extends State<CameraHome> {
-  static const Duration _processingInterval = Duration(seconds: 1);
   static const Duration _inferenceInterval = Duration(milliseconds: 260);
-  static const Duration _metricsInterval = Duration(milliseconds: 200);
   static const int _metricsMaxDim = 360;
-  static const double _scoreThreshold = 0.4;
+  static const double _scoreThreshold = 0.2;
   static const double _nmsThreshold = 0.45;
   static const int _maxDetections = 20;
 
@@ -106,9 +104,7 @@ class _CameraHomeState extends State<CameraHome> {
   Metrics _metrics = Metrics.initial();
   String? _error;
   bool _isStreaming = false;
-  DateTime _lastMetricsUpdate = DateTime.fromMillisecondsSinceEpoch(0);
-  DateTime _lastProcessing = DateTime.fromMillisecondsSinceEpoch(0);
-  bool _preferMetricsNext = true;
+
   late final MetricsService _metricsService;
   late final DetectionService _detectionService;
   List<Detection> _detections = const [];
@@ -236,59 +232,21 @@ class _CameraHomeState extends State<CameraHome> {
     if (!mounted) {
       return;
     }
-    final shouldRunMetrics =
-        now.difference(_lastMetricsUpdate) >= _metricsInterval;
-    final shouldRunInference = _canRunInference(now);
-    if (!shouldRunMetrics && !shouldRunInference) {
-      return;
-    }
 
-    if (now.difference(_lastProcessing) < _processingInterval) {
-      return;
-    }
-    _lastProcessing = now;
-
-    var runMetrics = shouldRunMetrics;
-    var runInference = shouldRunInference;
-    if (runMetrics && runInference) {
-      if (_preferMetricsNext) {
-        runInference = false;
-      } else {
-        runMetrics = false;
+    try {
+      final nextMetrics = _metricsService.process(
+        current: _metrics,
+        image: image,
+      );
+      if (mounted) {
+        setState(() {
+          _metrics = nextMetrics;
+        });
       }
-      _preferMetricsNext = !_preferMetricsNext;
+    } catch (_) {
+      // Ignore metric errors to avoid blocking the preview.
     }
-
-    if (runMetrics) {
-      _lastMetricsUpdate = now;
-      try {
-        final nextMetrics = _metricsService.process(
-          current: _metrics,
-          image: image,
-        );
-        if (mounted) {
-          setState(() {
-            _metrics = nextMetrics;
-          });
-        }
-      } catch (_) {
-        // Ignore metric errors to avoid blocking the preview.
-      }
-    }
-
-    if (runInference) {
-      _maybeRunDetection(image, now);
-    }
-  }
-
-  bool _canRunInference(DateTime now) {
-    if (!_detectionService.isReady) {
-      return false;
-    }
-    if (_detectionService.isBusy) {
-      return false;
-    }
-    return now.difference(_lastInference) >= _inferenceInterval;
+    _maybeRunDetection(image, now);
   }
 
   void _maybeRunDetection(CameraImage image, DateTime now) {
@@ -380,10 +338,11 @@ class _CameraHomeState extends State<CameraHome> {
     final rotateOverlay =
         !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
-    return Scaffold(
-      body: Stack(
+    return Material(
+      child: Stack(
+        alignment: Alignment.topCenter,
         children: [
-          Positioned.fill(
+          SafeArea(
             child: CameraPreview(
               controller,
               child: CustomPaint(
