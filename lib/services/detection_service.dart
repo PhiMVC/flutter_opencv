@@ -4,7 +4,6 @@ import 'dart:ui';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
-import 'package:opencv_dart/opencv_dart.dart' as cv;
 import 'package:tflite_flutter/tflite_flutter.dart';
 
 import '../models/detection.dart';
@@ -53,6 +52,12 @@ class DetectionService {
   Float32List? _inputBufferF32;
   Uint8List? _inputBufferU8;
   Uint8List? _rgbBuffer;
+  Int32List? _xMap;
+  Int32List? _yMap;
+  int _xMapSrc = 0;
+  int _xMapDst = 0;
+  int _yMapSrc = 0;
+  int _yMapDst = 0;
   bool _isBusy = false;
   String? _modelError;
   bool _loggedOutputSample = false;
@@ -124,8 +129,6 @@ class DetectionService {
     }
 
     _isBusy = true;
-    cv.Mat? srcMat;
-    cv.Mat? inputMat;
     try {
       final inputW = _inputWidth;
       final inputH = _inputHeight;
@@ -134,17 +137,8 @@ class DetectionService {
       }
 
       final start = DateTime.now();
-      final rgb = _convertCameraImageToRgb(image);
-      srcMat = cv.Mat.fromList(
-        image.height,
-        image.width,
-        cv.MatType.CV_8UC3,
-        rgb,
-      );
-
-      final (letterbox, mat) = _letterboxAndResize(srcMat, inputW, inputH);
-      inputMat = mat;
-      final inputBytes = inputMat.data;
+      final (letterbox, inputBytes) =
+          _letterboxAndConvertToRgb(image, inputW, inputH);
       final inputTensor = _buildInputTensor(inputBytes, inputW, inputH);
 
       final outputBuffers = _outputBuffers;
@@ -194,8 +188,6 @@ class DetectionService {
       _modelError = 'Inference error: $e';
       return null;
     } finally {
-      inputMat?.dispose();
-      srcMat?.dispose();
       _isBusy = false;
     }
   }
@@ -385,15 +377,23 @@ class DetectionService {
     return buffer.reshape([1, inputH, inputW, 3]);
   }
 
-  (_LetterboxInfo, cv.Mat) _letterboxAndResize(
-    cv.Mat src,
+  (_LetterboxInfo, Uint8List) _letterboxAndConvertToRgb(
+    CameraImage image,
     int inputW,
     int inputH,
   ) {
-    final srcW = src.width;
-    final srcH = src.height;
-    if (srcW == 0 || srcH == 0) {
-      final empty = cv.Mat.zeros(inputH, inputW, src.type);
+    final srcW = image.width;
+    final srcH = image.height;
+    final needed = inputW * inputH * 3;
+    var rgb = _rgbBuffer;
+    if (rgb == null || rgb.length != needed) {
+      rgb = Uint8List(needed);
+      _rgbBuffer = rgb;
+    } else {
+      rgb.fillRange(0, needed, 0);
+    }
+
+    if (srcW <= 0 || srcH <= 0 || inputW <= 0 || inputH <= 0) {
       return (
         _LetterboxInfo(
           scale: 1,
@@ -404,72 +404,56 @@ class DetectionService {
           srcWidth: srcW,
           srcHeight: srcH,
         ),
-        empty,
+        rgb,
       );
     }
 
     final scale = math.min(inputW / srcW, inputH / srcH);
-    final resizedW = (srcW * scale).round();
-    final resizedH = (srcH * scale).round();
-    final resized = cv.resize(src, (resizedW, resizedH));
-
-    final canvas = cv.Mat.zeros(inputH, inputW, src.type);
+    final resizedW = math.min(inputW, math.max(1, (srcW * scale).round()));
+    final resizedH = math.min(inputH, math.max(1, (srcH * scale).round()));
     final dx = ((inputW - resizedW) / 2).round();
     final dy = ((inputH - resizedH) / 2).round();
-    final roiRect = cv.Rect(dx, dy, resizedW, resizedH);
-    final roi = canvas.region(roiRect);
-    resized.copyTo(roi);
-    roi.dispose();
-    roiRect.dispose();
-    resized.dispose();
 
-    return (
-      _LetterboxInfo(
-        scale: scale,
-        dx: dx.toDouble(),
-        dy: dy.toDouble(),
-        inputWidth: inputW,
-        inputHeight: inputH,
-        srcWidth: srcW,
-        srcHeight: srcH,
-      ),
-      canvas,
+    final xMap = _axisMap(
+      srcSize: srcW,
+      dstSize: resizedW,
+      isX: true,
     );
-  }
+    final yMap = _axisMap(
+      srcSize: srcH,
+      dstSize: resizedH,
+      isX: false,
+    );
 
-  Uint8List _convertCameraImageToRgb(CameraImage image) {
-    final width = image.width;
-    final height = image.height;
-    final needed = width * height * 3;
-    var rgb = _rgbBuffer;
-    if (rgb == null || rgb.length != needed) {
-      rgb = Uint8List(needed);
-      _rgbBuffer = rgb;
-    }
     final yPlane = image.planes[0];
     final uPlane = image.planes.length > 1 ? image.planes[1] : null;
     final vPlane = image.planes.length > 2 ? image.planes[2] : null;
+    final yBytes = yPlane.bytes;
+    final uBytes = uPlane?.bytes;
+    final vBytes = vPlane?.bytes;
 
     final yRowStride = yPlane.bytesPerRow;
     final uvRowStride = uPlane?.bytesPerRow ?? 0;
     final uvPixelStride = uPlane?.bytesPerPixel ?? 1;
 
-    var index = 0;
-    for (var y = 0; y < height; y++) {
-      final yRow = yRowStride * y;
-      final uvRow = uvRowStride * (y >> 1);
-      for (var x = 0; x < width; x++) {
-        final yValue = yPlane.bytes[yRow + x];
+    for (var y = 0; y < resizedH; y++) {
+      final srcY = yMap[y];
+      final yRow = yRowStride * srcY;
+      final uvRow = uvRowStride * (srcY >> 1);
+      final dstRow = (y + dy) * inputW * 3;
+      for (var x = 0; x < resizedW; x++) {
+        final srcX = xMap[x];
+        final yValue = yBytes[yRow + srcX];
         int uValue = 0;
         int vValue = 0;
-        if (uPlane != null) {
-          final uvIndex = uvRow + (x >> 1) * uvPixelStride;
+        if (uPlane != null && uBytes != null) {
+          final uvIndex = uvRow + (srcX >> 1) * uvPixelStride;
           if (image.planes.length == 2) {
-            uValue = uPlane.bytes[uvIndex];
-            vValue = uPlane.bytes[uvIndex + 1];
-          } else if (vPlane != null) {
-            uValue = uPlane.bytes[uvIndex];
-            vValue = vPlane.bytes[uvIndex];
+            uValue = uBytes[uvIndex];
+            vValue = uBytes[uvIndex + 1];
+          } else if (vPlane != null && vBytes != null) {
+            uValue = uBytes[uvIndex];
+            vValue = vBytes[uvIndex];
           }
         }
 
@@ -484,12 +468,61 @@ class DetectionService {
         g = _clampInt(g, 0, 255);
         b = _clampInt(b, 0, 255);
 
-        rgb[index++] = r;
-        rgb[index++] = g;
-        rgb[index++] = b;
+        final dstIndex = dstRow + (x + dx) * 3;
+        rgb[dstIndex] = r;
+        rgb[dstIndex + 1] = g;
+        rgb[dstIndex + 2] = b;
       }
     }
-    return rgb;
+
+    return (
+      _LetterboxInfo(
+        scale: scale,
+        dx: dx.toDouble(),
+        dy: dy.toDouble(),
+        inputWidth: inputW,
+        inputHeight: inputH,
+        srcWidth: srcW,
+        srcHeight: srcH,
+      ),
+      rgb,
+    );
+  }
+
+  Int32List _axisMap({
+    required int srcSize,
+    required int dstSize,
+    required bool isX,
+  }) {
+    if (dstSize <= 0) {
+      return Int32List(0);
+    }
+    if (isX) {
+      if (_xMap != null && _xMapSrc == srcSize && _xMapDst == dstSize) {
+        return _xMap!;
+      }
+    } else {
+      if (_yMap != null && _yMapSrc == srcSize && _yMapDst == dstSize) {
+        return _yMap!;
+      }
+    }
+
+    final map = Int32List(dstSize);
+    final ratio = srcSize / dstSize;
+    for (var i = 0; i < dstSize; i++) {
+      final v = (i * ratio).round();
+      map[i] = v.clamp(0, srcSize - 1);
+    }
+    if (isX) {
+      _xMap = map;
+      _xMapSrc = srcSize;
+      _xMapDst = dstSize;
+    } else {
+      _yMap = map;
+      _yMapSrc = srcSize;
+      _yMapDst = dstSize;
+    }
+    return map;
   }
 
   List<Detection> _parseDetections(
