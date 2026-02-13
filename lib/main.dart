@@ -98,6 +98,8 @@ class CameraHome extends StatefulWidget {
 class _CameraHomeState extends State<CameraHome> {
   static const int _minInferenceIntervalMs = 60;
   static const int _metricsMaxDim = 360;
+  static const Duration _metricsInterval = Duration(milliseconds: 150);
+  static const Duration _detectionHold = Duration(milliseconds: 250);
   static const double _scoreThreshold = 0.2;
   static const double _nmsThreshold = 0.9;
   static const int _maxDetections = 100;
@@ -112,6 +114,10 @@ class _CameraHomeState extends State<CameraHome> {
   List<Detection> _detections = const [];
   DateTime _lastInference = DateTime.fromMillisecondsSinceEpoch(0);
   int _lastInferenceMs = 0;
+  DateTime _lastMetrics = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastNonEmptyDetection = DateTime.fromMillisecondsSinceEpoch(0);
+  List<Detection> _lastNonEmptyDetections = const [];
+  Size? _lastNonEmptyImageSize;
   Size? _analysisImageSize;
   String? _modelError;
 
@@ -235,18 +241,22 @@ class _CameraHomeState extends State<CameraHome> {
       return;
     }
 
-    try {
-      final nextMetrics = _metricsService.process(
-        current: _metrics,
-        image: image,
-      );
-      if (mounted) {
-        setState(() {
-          _metrics = nextMetrics;
-        });
+    if (!_detectionService.isBusy &&
+        now.difference(_lastMetrics) >= _metricsInterval) {
+      _lastMetrics = now;
+      try {
+        final nextMetrics = _metricsService.process(
+          current: _metrics,
+          image: image,
+        );
+        if (mounted) {
+          setState(() {
+            _metrics = nextMetrics;
+          });
+        }
+      } catch (_) {
+        // Ignore metric errors to avoid blocking the preview.
       }
-    } catch (_) {
-      // Ignore metric errors to avoid blocking the preview.
     }
     _maybeRunDetection(image, now);
   }
@@ -267,6 +277,7 @@ class _CameraHomeState extends State<CameraHome> {
 
   Future<void> _runDetection(CameraImage image) async {
     try {
+      final start = DateTime.now();
       final result = await _detectionService.run(image);
       if (!mounted) {
         return;
@@ -277,17 +288,28 @@ class _CameraHomeState extends State<CameraHome> {
         });
         return;
       }
-      if (result.detections.isNotEmpty) {
-        final top = result.detections.first;
+      var nextDetections = result.detections;
+      var nextImageSize = result.imageSize;
+      if (nextDetections.isNotEmpty) {
+        _lastNonEmptyDetection = start;
+        _lastNonEmptyDetections = nextDetections;
+        _lastNonEmptyImageSize = nextImageSize;
+        final top = nextDetections.first;
         debugPrint(
-          'TF detect: ${result.detections.length} objects. '
+          'TF detect: ${nextDetections.length} objects. '
           'Top id=${top.classId}, '
           'score=${(top.score * 100).toStringAsFixed(1)}%',
         );
+      } else if (start.difference(_lastNonEmptyDetection) <= _detectionHold &&
+          _lastNonEmptyDetections.isNotEmpty) {
+        nextDetections = _lastNonEmptyDetections;
+        if (_lastNonEmptyImageSize != null) {
+          nextImageSize = _lastNonEmptyImageSize!;
+        }
       }
       setState(() {
-        _analysisImageSize = result.imageSize;
-        _detections = result.detections;
+        _analysisImageSize = nextImageSize;
+        _detections = nextDetections;
         _lastInferenceMs = result.inferenceMs;
         _modelError = _detectionService.modelError;
       });
