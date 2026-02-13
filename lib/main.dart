@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -94,7 +96,7 @@ class CameraHome extends StatefulWidget {
 }
 
 class _CameraHomeState extends State<CameraHome> {
-  static const Duration _inferenceInterval = Duration(milliseconds: 260);
+  static const int _minInferenceIntervalMs = 60;
   static const int _metricsMaxDim = 360;
   static const double _scoreThreshold = 0.2;
   static const double _nmsThreshold = 0.9;
@@ -253,7 +255,10 @@ class _CameraHomeState extends State<CameraHome> {
     if (!_detectionService.isReady || _detectionService.isBusy) {
       return;
     }
-    if (now.difference(_lastInference) < _inferenceInterval) {
+    final minIntervalMs = _lastInferenceMs <= 0
+        ? _minInferenceIntervalMs
+        : math.max(_minInferenceIntervalMs, _lastInferenceMs);
+    if (now.difference(_lastInference).inMilliseconds < minIntervalMs) {
       return;
     }
     _lastInference = now;
@@ -304,14 +309,29 @@ class _CameraHomeState extends State<CameraHome> {
             controller.value.deviceOrientation);
   }
 
-  int _quarterTurns(DeviceOrientation orientation) {
-    const turns = <DeviceOrientation, int>{
-      DeviceOrientation.portraitUp: 0,
-      DeviceOrientation.landscapeRight: 1,
-      DeviceOrientation.portraitDown: 2,
-      DeviceOrientation.landscapeLeft: 3,
-    };
-    return turns[orientation] ?? 0;
+  int _deviceOrientationToDegrees(DeviceOrientation orientation) {
+    switch (orientation) {
+      case DeviceOrientation.portraitUp:
+        return 0;
+      case DeviceOrientation.landscapeLeft:
+        return 90;
+      case DeviceOrientation.portraitDown:
+        return 180;
+      case DeviceOrientation.landscapeRight:
+        return 270;
+    }
+  }
+
+  int _overlayQuarterTurns(CameraController controller) {
+    final orientation = _getApplicableOrientation(controller);
+    final deviceDegrees = _deviceOrientationToDegrees(orientation);
+    final sensorOrientation = controller.description.sensorOrientation;
+    final isFront =
+        controller.description.lensDirection == CameraLensDirection.front;
+    final rotationDegrees = isFront
+        ? (sensorOrientation + deviceDegrees) % 360
+        : (sensorOrientation - deviceDegrees + 360) % 360;
+    return (rotationDegrees ~/ 90) % 4;
   }
 
   @override
@@ -333,10 +353,10 @@ class _CameraHomeState extends State<CameraHome> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    final orientation = _getApplicableOrientation(controller);
-    final quarterTurns = _quarterTurns(orientation);
     final rotateOverlay =
         !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+    final quarterTurns =
+        rotateOverlay ? _overlayQuarterTurns(controller) : 0;
 
     return Material(
       child: Stack(
