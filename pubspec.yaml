@@ -39,6 +39,7 @@ dependencies:
   opencv_dart: ^1.4.5
   tflite_flutter: ^0.11.0
   sensors_plus: ^5.0.0
+  path_provider: ^2.1.2
 
 dev_dependencies:
   flutter_test:

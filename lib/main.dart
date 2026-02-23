@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
@@ -8,7 +9,9 @@ import 'package:flutter/services.dart';
 import 'models/detection.dart';
 import 'models/metrics.dart';
 import 'services/detection_service.dart';
+import 'services/image_iou_service.dart';
 import 'services/metrics_service.dart';
+import 'services/temp_gallery_service.dart';
 import 'widgets/detection_painter.dart';
 import 'widgets/axes_overlay.dart';
 import 'widgets/metrics_panel.dart';
@@ -112,6 +115,8 @@ class _CameraHomeState extends State<CameraHome> {
 
   late final MetricsService _metricsService;
   late final DetectionService _detectionService;
+  late final TempGalleryService _galleryService;
+  late final ImageIouService _iouService;
   List<Detection> _detections = const [];
   DateTime _lastInference = DateTime.fromMillisecondsSinceEpoch(0);
   int _lastInferenceMs = 0;
@@ -121,6 +126,9 @@ class _CameraHomeState extends State<CameraHome> {
   Size? _lastNonEmptyImageSize;
   Size? _analysisImageSize;
   String? _modelError;
+  bool _isCapturing = false;
+  List<File> _tempImages = const [];
+  double? _lastIou;
   @override
   void initState() {
     super.initState();
@@ -131,6 +139,9 @@ class _CameraHomeState extends State<CameraHome> {
       nmsThreshold: _nmsThreshold,
       maxDetections: _maxDetections,
     );
+    _galleryService = TempGalleryService();
+    _iouService = ImageIouService();
+    _loadTempImages();
     _initializeCamera();
     _loadModel();
   }
@@ -193,6 +204,221 @@ class _CameraHomeState extends State<CameraHome> {
         _modelError = 'Model error: $e';
       });
     }
+  }
+
+  Future<void> _loadTempImages() async {
+    try {
+      final images = await _galleryService.listImages();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _tempImages = images;
+      });
+    } catch (_) {
+      // Ignore gallery errors for now.
+    }
+  }
+
+  Future<void> _captureImage() async {
+    if (_isCapturing) {
+      return;
+    }
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) {
+      return;
+    }
+
+    setState(() {
+      _isCapturing = true;
+    });
+
+    try {
+      await _stopImageStream();
+      final file = await controller.takePicture();
+      await _galleryService.saveFromXFile(file);
+      await _loadTempImages();
+    } catch (_) {
+      // Ignore capture errors to keep preview responsive.
+    } finally {
+      if (mounted) {
+        await _startImageStream();
+        setState(() {
+          _isCapturing = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _openGallery() async {
+    if (!mounted) {
+      return;
+    }
+    await _loadTempImages();
+    if (!mounted) {
+      return;
+    }
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.black,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (context) {
+        var selected = <File>[];
+        double? iou;
+        var busy = false;
+
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            Future<void> compare() async {
+              if (selected.length != 2) {
+                return;
+              }
+              setSheetState(() {
+                busy = true;
+              });
+              final result = await _iouService.computeIoU(
+                selected[0],
+                selected[1],
+              );
+              if (!mounted) {
+                return;
+              }
+              setSheetState(() {
+                busy = false;
+                iou = result;
+              });
+              setState(() {
+                _lastIou = result;
+              });
+            }
+
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 40,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Text(
+                          'Kho ảnh tạm (${_tempImages.length})',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const Spacer(),
+                        if (iou != null)
+                          Text(
+                            'IoU ${(iou! * 100).toStringAsFixed(1)}%',
+                            style: const TextStyle(
+                              color: Colors.lightGreenAccent,
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      height: 320,
+                      child: GridView.builder(
+                        gridDelegate:
+                            const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 3,
+                              crossAxisSpacing: 8,
+                              mainAxisSpacing: 8,
+                            ),
+                        itemCount: _tempImages.length,
+                        itemBuilder: (context, index) {
+                          final file = _tempImages[index];
+                          final isSelected = selected.contains(file);
+                          return GestureDetector(
+                            onTap: () {
+                              setSheetState(() {
+                                if (isSelected) {
+                                  selected.remove(file);
+                                } else {
+                                  if (selected.length < 2) {
+                                    selected.add(file);
+                                  } else {
+                                    selected
+                                      ..removeAt(0)
+                                      ..add(file);
+                                  }
+                                }
+                                iou = null;
+                              });
+                            },
+                            child: Container(
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: isSelected
+                                      ? Colors.lightGreenAccent
+                                      : Colors.white24,
+                                  width: isSelected ? 2 : 1,
+                                ),
+                              ),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(7),
+                                child: Image.file(
+                                  file,
+                                  fit: BoxFit.cover,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            onPressed: selected.length == 2 && !busy
+                                ? compare
+                                : null,
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.white,
+                            ),
+                            child: busy
+                                ? const SizedBox(
+                                    height: 16,
+                                    width: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : const Text('So sánh IoU'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   Future<void> _startImageStream() async {
@@ -357,6 +583,58 @@ class _CameraHomeState extends State<CameraHome> {
     return (rotationDegrees ~/ 90) % 4;
   }
 
+  Widget _buildCaptureBar() {
+    final galleryLabel = 'Kho ảnh (${_tempImages.length})';
+    final captureLabel = _isCapturing ? 'Đang chụp...' : 'Chụp ảnh';
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _isCapturing ? null : _captureImage,
+                  icon: const Icon(Icons.camera_alt_outlined, size: 18),
+                  label: Text(captureLabel),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _openGallery,
+                  icon: const Icon(Icons.photo_library_outlined, size: 18),
+                  label: Text(galleryLabel),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.white,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (_lastIou != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              'IoU ${(100 * _lastIou!).toStringAsFixed(1)}%',
+              style: const TextStyle(
+                color: Colors.lightGreenAccent,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_error != null) {
@@ -418,7 +696,17 @@ class _CameraHomeState extends State<CameraHome> {
             left: 12,
             right: 12,
             bottom: 12,
-            child: SafeArea(top: false, child: MetricsPanel(metrics: _metrics)),
+            child: SafeArea(
+              top: false,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _buildCaptureBar(),
+                  const SizedBox(height: 8),
+                  MetricsPanel(metrics: _metrics),
+                ],
+              ),
+            ),
           ),
         ],
       ),
