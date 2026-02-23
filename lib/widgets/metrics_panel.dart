@@ -26,13 +26,13 @@ class MetricsPanel extends StatelessWidget {
               isValid: metrics.isSharpnessOk,
             ),
             MetricRow(
-              label: 'Ngang',
-              value: '${metrics.angle.toStringAsFixed(1)} deg',
+              label: 'Nghiêng L/R',
+              value: '${metrics.angle.toStringAsFixed(1)}°',
               isValid: metrics.isAngleOk,
             ),
             MetricRow(
-              label: 'Dọc',
-              value: '${metrics.tiltVertical.toStringAsFixed(1)} deg',
+              label: 'Nghiêng U/D',
+              value: '${metrics.tiltVertical.toStringAsFixed(1)}°',
               isValid: metrics.isTiltVerticalOk,
             ),
             MetricRow(

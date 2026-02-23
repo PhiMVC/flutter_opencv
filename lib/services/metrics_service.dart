@@ -1,21 +1,54 @@
+import 'dart:async';
 import 'dart:math' as math;
-import 'dart:typed_data';
+import 'dart:ui';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:opencv_dart/opencv_dart.dart' as cv;
+import 'package:sensors_plus/sensors_plus.dart';
 
 import '../models/metrics.dart';
 
 class MetricsService {
-  MetricsService({required this.maxDim});
+  MetricsService({
+    required this.maxDim,
+    this.smoothing = 0.3,
+    this.maxTiltAngle = 45,
+    this.sensorInterval = SensorInterval.gameInterval,
+    this.axesSmoothing = 0.35,
+  }) {
+    _startSensors();
+  }
 
   final int maxDim;
-  Uint8List? _prevLuma;
+  final double smoothing;
+  final double maxTiltAngle;
+  final Duration sensorInterval;
+  final double axesSmoothing;
 
-  Metrics process({
-    required Metrics current,
-    required CameraImage image,
-  }) {
+  Uint8List? _prevLuma;
+  StreamSubscription<AccelerometerEvent>? _tiltSubscription;
+  bool _sensorFailed = false;
+  double _tiltRollDeg = 0;
+  double _tiltPitchDeg = 0;
+  Offset _sensorUpDir = const Offset(0, -1);
+  final ValueNotifier<Offset> _sensorUpNotifier = ValueNotifier<Offset>(
+    const Offset(0, -1),
+  );
+  bool _calibrated = false;
+  int _calibrationCount = 0;
+  double _calibrationRollSum = 0;
+  double _calibrationPitchSum = 0;
+  double _rollZero = 0;
+  double _pitchZero = 0;
+  static const double _zeroThreshold = 3.0;
+  static const double _zeroAlpha = 0.08;
+  static const double _minUpProjection = 0.08;
+
+  ValueListenable<Offset> get sensorUpListenable => _sensorUpNotifier;
+
+  Metrics process({required Metrics current, required CameraImage image}) {
+    _startSensors();
     final yPlane = image.planes[0];
     final packed = _packLumaPlane(
       yPlane.bytes,
@@ -36,21 +69,8 @@ class MetricsService {
       try {
         final (mean, stddev) = cv.meanStdDev(metricsMat);
         try {
-          final (gradX, gradY) = _computeGradients(metricsMat);
-          double angleDeg;
-          double tiltVerticalDeg;
-          try {
-            angleDeg = _dominantAngleDegrees(gradX, gradY);
-            tiltVerticalDeg = _verticalTiltDegrees(
-              gradX,
-              gradY,
-              metricsMat.width,
-              metricsMat.height,
-            );
-          } finally {
-            gradX.dispose();
-            gradY.dispose();
-          }
+          final angleDeg = _tiltRollDeg;
+          final tiltVerticalDeg = _tiltPitchDeg;
 
           final shakeRaw = _frameDifference(packed, _prevLuma);
           _updatePrevLuma(packed);
@@ -94,80 +114,91 @@ class MetricsService {
     return cv.resize(src, (targetW, targetH));
   }
 
-  (cv.Mat, cv.Mat) _computeGradients(cv.Mat src) {
-    final gradX = cv.sobel(src, cv.MatType.CV_32F, 1, 0, ksize: 3);
-    final gradY = cv.sobel(src, cv.MatType.CV_32F, 0, 1, ksize: 3);
-    return (gradX, gradY);
+  void dispose() {
+    _tiltSubscription?.cancel();
+    _tiltSubscription = null;
+    _sensorUpNotifier.dispose();
   }
 
-  double _dominantAngleDegrees(cv.Mat gradX, cv.Mat gradY) {
-    final gx = _matToFloat32(gradX);
-    final gy = _matToFloat32(gradY);
-    final length = gx.length < gy.length ? gx.length : gy.length;
-
-    const sampleStep = 4;
-    double sumXX = 0;
-    double sumYY = 0;
-    double sumXY = 0;
-    for (var i = 0; i < length; i += sampleStep) {
-      final dx = gx[i];
-      final dy = gy[i];
-      sumXX += dx * dx;
-      sumYY += dy * dy;
-      sumXY += dx * dy;
+  void _startSensors() {
+    if (_sensorFailed || _tiltSubscription != null) {
+      return;
     }
 
-    if (sumXX + sumYY == 0) {
-      return 0;
+    try {
+      _tiltSubscription = accelerometerEventStream(
+        samplingPeriod: sensorInterval,
+      ).listen(
+        _handleAccelerometer,
+        onError: (_) {
+          _sensorFailed = true;
+          _tiltSubscription?.cancel();
+          _tiltSubscription = null;
+        },
+      );
+    } catch (_) {
+      _sensorFailed = true;
     }
-
-    final angleRad = 0.5 * math.atan2(2 * sumXY, sumXX - sumYY);
-    return angleRad * 180 / math.pi;
   }
 
-  double _verticalTiltDegrees(
-    cv.Mat gradX,
-    cv.Mat gradY,
-    int width,
-    int height,
-  ) {
-    if (width <= 0 || height <= 0) {
-      return 0;
+  void _handleAccelerometer(AccelerometerEvent event) {
+    final ax = event.x;
+    final ay = event.y;
+    final az = event.z;
+
+    final gravity = math.sqrt(ax * ax + ay * ay + az * az);
+    if (gravity == 0) {
+      return;
     }
 
-    final gx = _matToFloat32(gradX);
-    final gy = _matToFloat32(gradY);
-    final length = gx.length < gy.length ? gx.length : gy.length;
-    final total = width * height;
-    final usable = length < total ? length : total;
-    final half = height ~/ 2;
+    final nx = ax / gravity;
+    final ny = ay / gravity;
+    final projectedUp = Offset(-nx, -ny);
+    final projLength = projectedUp.distance;
+    if (projLength >= _minUpProjection) {
+      final targetUpDevice = projectedUp / projLength;
+      // Convert device coords (y up) to canvas coords (y down).
+      final targetUpCanvas = Offset(targetUpDevice.dx, -targetUpDevice.dy);
+      final smoothedUp =
+          Offset.lerp(_sensorUpDir, targetUpCanvas, axesSmoothing) ??
+          targetUpCanvas;
+      final normalizedUp = _normalizeOffset(smoothedUp);
+      _sensorUpDir = normalizedUp;
+      _sensorUpNotifier.value = normalizedUp;
+    }
 
-    const sampleStep = 4;
-    double top = 0;
-    double bottom = 0;
-    for (var i = 0; i < usable; i += sampleStep) {
-      final mag = gx[i].abs() + gy[i].abs();
-      final y = i ~/ width;
-      if (y < half) {
-        top += mag;
-      } else {
-        bottom += mag;
+    // Map gravity to roll/pitch when the phone is held upright (portrait).
+    // Using -ay as the vertical reference keeps 0° when the phone is straight.
+    // Invert roll to match intuitive left/right tilt direction.
+    var rollTarget = -math.atan2(ax, -ay) * 180 / math.pi;
+    var pitchTarget = math.atan2(az, -ay) * 180 / math.pi;
+
+    if (!_calibrated) {
+      _calibrationRollSum += rollTarget;
+      _calibrationPitchSum += pitchTarget;
+      _calibrationCount++;
+      if (_calibrationCount >= 25) {
+        _rollZero = _calibrationRollSum / _calibrationCount;
+        _pitchZero = _calibrationPitchSum / _calibrationCount;
+        _calibrated = true;
       }
+      return;
     }
 
-    final denom = top + bottom;
-    if (denom == 0) {
-      return 0;
+    if (rollTarget.abs() < _zeroThreshold &&
+        pitchTarget.abs() < _zeroThreshold) {
+      _rollZero = _smooth(_rollZero, rollTarget, _zeroAlpha);
+      _pitchZero = _smooth(_pitchZero, pitchTarget, _zeroAlpha);
     }
 
-    final imbalance = (bottom - top) / denom;
-    return imbalance * 30;
-  }
+    rollTarget -= _rollZero;
+    pitchTarget -= _pitchZero;
 
-  Float32List _matToFloat32(cv.Mat mat) {
-    final data = mat.data;
-    final length = mat.total * mat.channels;
-    return Float32List.view(data.buffer, data.offsetInBytes, length);
+    final smoothedRoll = _smooth(_tiltRollDeg, rollTarget, smoothing);
+    final smoothedPitch = _smooth(_tiltPitchDeg, pitchTarget, smoothing);
+
+    _tiltRollDeg = _clamp(smoothedRoll, -maxTiltAngle, maxTiltAngle);
+    _tiltPitchDeg = _clamp(smoothedPitch, -maxTiltAngle, maxTiltAngle);
   }
 
   double _frameDifference(Uint8List current, Uint8List? prev) {
@@ -186,6 +217,28 @@ class MetricsService {
       return 0;
     }
     return sum / count;
+  }
+
+  double _smooth(double current, double target, double alpha) {
+    return current + (target - current) * alpha;
+  }
+
+  double _clamp(double value, double min, double max) {
+    if (value < min) {
+      return min;
+    }
+    if (value > max) {
+      return max;
+    }
+    return value;
+  }
+
+  Offset _normalizeOffset(Offset value) {
+    final length = value.distance;
+    if (length <= 0) {
+      return const Offset(0, -1);
+    }
+    return value / length;
   }
 
   Uint8List _packLumaPlane(

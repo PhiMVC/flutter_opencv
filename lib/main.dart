@@ -10,6 +10,7 @@ import 'models/metrics.dart';
 import 'services/detection_service.dart';
 import 'services/metrics_service.dart';
 import 'widgets/detection_painter.dart';
+import 'widgets/axes_overlay.dart';
 import 'widgets/metrics_panel.dart';
 
 Future<void> main() async {
@@ -120,7 +121,6 @@ class _CameraHomeState extends State<CameraHome> {
   Size? _lastNonEmptyImageSize;
   Size? _analysisImageSize;
   String? _modelError;
-
   @override
   void initState() {
     super.initState();
@@ -139,6 +139,7 @@ class _CameraHomeState extends State<CameraHome> {
   void dispose() {
     _stopImageStream();
     _detectionService.dispose();
+    _metricsService.dispose();
     _controller?.dispose();
     super.dispose();
   }
@@ -397,6 +398,18 @@ class _CameraHomeState extends State<CameraHome> {
                       CameraLensDirection.front,
                   inferenceMs: _lastInferenceMs,
                   modelError: _modelError,
+                ),
+              ),
+            ),
+          ),
+          Positioned.fill(
+            child: SafeArea(
+              child: IgnorePointer(
+                child: ValueListenableBuilder<Offset>(
+                  valueListenable: _metricsService.sensorUpListenable,
+                  builder: (context, sensorUp, _) {
+                    return AxesOverlay(sensorUp: sensorUp);
+                  },
                 ),
               ),
             ),
