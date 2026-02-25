@@ -1,3 +1,4 @@
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui';
@@ -27,9 +28,12 @@ class DetectionService {
     this.scoreThreshold = 0.4,
     this.nmsThreshold = 0.45,
     this.maxDetections = 20,
-    this.enableLogs = true,
+    this.enableLogs = false,
     this.logEveryN = 1,
     this.logSampleSize = 8,
+    this.profilingEnabled = false,
+    this.profilingEveryN = 30,
+    this.useBackgroundPreprocess = false,
   });
 
   final String modelAsset;
@@ -40,6 +44,9 @@ class DetectionService {
   final bool enableLogs;
   final int logEveryN;
   final int logSampleSize;
+  final bool profilingEnabled;
+  final int profilingEveryN;
+  final bool useBackgroundPreprocess;
 
   Interpreter? _interpreter;
   IsolateInterpreter? _isolateInterpreter;
@@ -62,6 +69,7 @@ class DetectionService {
   String? _modelError;
   bool _loggedOutputSample = false;
   int _inferenceCount = 0;
+  int _profileCount = 0;
 
   bool get isBusy => _isBusy;
   bool get isReady =>
@@ -130,6 +138,9 @@ class DetectionService {
 
     _isBusy = true;
     try {
+      final shouldProfile = _shouldProfile();
+      final totalSw = shouldProfile ? Stopwatch() : null;
+      totalSw?.start();
       final inputW = _inputWidth;
       final inputH = _inputHeight;
       if (inputW <= 0 || inputH <= 0) {
@@ -137,9 +148,20 @@ class DetectionService {
       }
 
       final start = DateTime.now();
-      final (letterbox, inputBytes) =
-          _letterboxAndConvertToRgb(image, inputW, inputH);
+      final preprocessSw = shouldProfile ? Stopwatch() : null;
+      preprocessSw?.start();
+      final preprocessed = await _preprocessImage(image, inputW, inputH);
+      preprocessSw?.stop();
+      if (preprocessed == null) {
+        return null;
+      }
+      final letterbox = preprocessed.letterbox;
+      final inputBytes = preprocessed.rgb;
+
+      final inputSw = shouldProfile ? Stopwatch() : null;
+      inputSw?.start();
       final inputTensor = _buildInputTensor(inputBytes, inputW, inputH);
+      inputSw?.stop();
 
       final outputBuffers = _outputBuffers;
       if (outputBuffers == null) {
@@ -156,17 +178,25 @@ class DetectionService {
         final headSample = _sampleOutput(inputTensor, logSampleSize);
         _log('Input head sample=${headSample.isEmpty ? "[]" : headSample}');
         final centerSample = _sampleInputCenter(inputW, inputH, logSampleSize);
-        _log('Input center sample=${centerSample.isEmpty ? "[]" : centerSample}');
+        _log(
+          'Input center sample=${centerSample.isEmpty ? "[]" : centerSample}',
+        );
       }
 
+      final inferSw = shouldProfile ? Stopwatch() : null;
+      inferSw?.start();
       final isolate = _isolateInterpreter;
       if (isolate != null) {
         await isolate.runForMultipleInputs([inputTensor], outputBuffers);
       } else {
         _interpreter!.runForMultipleInputs([inputTensor], outputBuffers);
       }
+      inferSw?.stop();
 
+      final parseSw = shouldProfile ? Stopwatch() : null;
+      parseSw?.start();
       final detections = _parseDetections(outputBuffers, letterbox);
+      parseSw?.stop();
       if (_shouldLogSample()) {
         _loggedOutputSample = true;
         for (var i = 0; i < _outputTensors.length; i++) {
@@ -178,6 +208,17 @@ class DetectionService {
       }
       final elapsedMs = DateTime.now().difference(start).inMilliseconds;
       _modelError = null;
+
+      if (shouldProfile) {
+        totalSw?.stop();
+        _logProfile(
+          'Profile: preprocess=${preprocessSw?.elapsedMilliseconds ?? 0}ms '
+          'input=${inputSw?.elapsedMilliseconds ?? 0}ms '
+          'infer=${inferSw?.elapsedMilliseconds ?? 0}ms '
+          'parse=${parseSw?.elapsedMilliseconds ?? 0}ms '
+          'total=${totalSw?.elapsedMilliseconds ?? 0}ms',
+        );
+      }
 
       return DetectionResult(
         detections: detections,
@@ -209,6 +250,11 @@ class DetectionService {
     debugPrint('[DetectionService] $message');
   }
 
+  void _logProfile(String message) {
+    if (!profilingEnabled) return;
+    debugPrint('[DetectionService] $message');
+  }
+
   String _formatParams(Tensor tensor) {
     final params = tensor.params;
     return 'scale=${params.scale}, zeroPoint=${params.zeroPoint}';
@@ -220,6 +266,15 @@ class DetectionService {
       return !_loggedOutputSample;
     }
     return _inferenceCount % logEveryN == 0;
+  }
+
+  bool _shouldProfile() {
+    if (!profilingEnabled) return false;
+    _profileCount++;
+    if (profilingEveryN <= 0) {
+      return _profileCount == 1;
+    }
+    return _profileCount % profilingEveryN == 0;
   }
 
   List<num> _sampleOutput(Object output, int maxCount) {
@@ -247,8 +302,7 @@ class DetectionService {
     if (channels <= 0 || inputW <= 0 || inputH <= 0) {
       return const [];
     }
-    final centerOffset =
-        ((inputH ~/ 2) * inputW + (inputW ~/ 2)) * channels;
+    final centerOffset = ((inputH ~/ 2) * inputW + (inputW ~/ 2)) * channels;
     final inputType = _inputType;
     if (inputType == TensorType.uint8) {
       final buffer = _inputBufferU8;
@@ -414,16 +468,8 @@ class DetectionService {
     final dx = ((inputW - resizedW) / 2).round();
     final dy = ((inputH - resizedH) / 2).round();
 
-    final xMap = _axisMap(
-      srcSize: srcW,
-      dstSize: resizedW,
-      isX: true,
-    );
-    final yMap = _axisMap(
-      srcSize: srcH,
-      dstSize: resizedH,
-      isX: false,
-    );
+    final xMap = _axisMap(srcSize: srcW, dstSize: resizedW, isX: true);
+    final yMap = _axisMap(srcSize: srcH, dstSize: resizedH, isX: false);
 
     final yPlane = image.planes[0];
     final uPlane = image.planes.length > 1 ? image.planes[1] : null;
@@ -487,6 +533,61 @@ class DetectionService {
       ),
       rgb,
     );
+  }
+
+  Future<_PreprocessedFrame?> _preprocessImage(
+    CameraImage image,
+    int inputW,
+    int inputH,
+  ) async {
+    if (!useBackgroundPreprocess) {
+      final (letterbox, rgb) = _letterboxAndConvertToRgb(image, inputW, inputH);
+      return _PreprocessedFrame(letterbox: letterbox, rgb: rgb);
+    }
+    final request = _buildPreprocessRequest(image, inputW, inputH);
+    final result = await compute(_preprocessFrame, request);
+    final rgbTtd = result['rgb'] as TransferableTypedData?;
+    if (rgbTtd == null) {
+      return null;
+    }
+    final rgb = rgbTtd.materialize().asUint8List();
+    final letterbox = _LetterboxInfo(
+      scale: (result['scale'] as num).toDouble(),
+      dx: (result['dx'] as num).toDouble(),
+      dy: (result['dy'] as num).toDouble(),
+      inputWidth: result['inputW'] as int,
+      inputHeight: result['inputH'] as int,
+      srcWidth: result['srcW'] as int,
+      srcHeight: result['srcH'] as int,
+    );
+    return _PreprocessedFrame(letterbox: letterbox, rgb: rgb);
+  }
+
+  Map<String, Object?> _buildPreprocessRequest(
+    CameraImage image,
+    int inputW,
+    int inputH,
+  ) {
+    final planes = image.planes;
+    final yPlane = planes[0];
+    TransferableTypedData copyPlane(Plane plane) {
+      final copy = Uint8List.fromList(plane.bytes);
+      return TransferableTypedData.fromList([copy]);
+    }
+
+    return <String, Object?>{
+      'width': image.width,
+      'height': image.height,
+      'inputW': inputW,
+      'inputH': inputH,
+      'planeCount': planes.length,
+      'yBytes': copyPlane(yPlane),
+      'yRowStride': yPlane.bytesPerRow,
+      'uvRowStride': planes.length > 1 ? planes[1].bytesPerRow : 0,
+      'uvPixelStride': planes.length > 1 ? (planes[1].bytesPerPixel ?? 1) : 1,
+      'uBytes': planes.length > 1 ? copyPlane(planes[1]) : null,
+      'vBytes': planes.length > 2 ? copyPlane(planes[2]) : null,
+    };
   }
 
   Int32List _axisMap({
@@ -608,7 +709,9 @@ class DetectionService {
     if (outputIdx == null) {
       return const [];
     }
-    _log('YOLO output index=$outputIdx shape=${_outputTensors[outputIdx].shape}');
+    _log(
+      'YOLO output index=$outputIdx shape=${_outputTensors[outputIdx].shape}',
+    );
 
     final output = outputs[outputIdx];
     if (output is! List || output.isEmpty) {
@@ -686,12 +789,7 @@ class DetectionService {
       final scaleY = normalized ? letterbox.inputHeight : 1.0;
       final rectInput =
           format == _YoloBoxFormat.xyxy
-              ? Rect.fromLTRB(
-                x * scaleX,
-                y * scaleY,
-                w * scaleX,
-                h * scaleY,
-              )
+              ? Rect.fromLTRB(x * scaleX, y * scaleY, w * scaleX, h * scaleY)
               : Rect.fromLTRB(
                 x * scaleX - (w * scaleX) / 2,
                 y * scaleY - (h * scaleY) / 2,
@@ -705,10 +803,7 @@ class DetectionService {
     return detections;
   }
 
-  List<Detection> _parseYoloChannelFirst(
-    List rows,
-    _LetterboxInfo letterbox,
-  ) {
+  List<Detection> _parseYoloChannelFirst(List rows, _LetterboxInfo letterbox) {
     final channels = rows.length;
     if (channels < 5) {
       return const [];
@@ -765,12 +860,7 @@ class DetectionService {
       final scaleY = normalized ? letterbox.inputHeight : 1.0;
       final rectInput =
           format == _YoloBoxFormat.xyxy
-              ? Rect.fromLTRB(
-                x * scaleX,
-                y * scaleY,
-                w * scaleX,
-                h * scaleY,
-              )
+              ? Rect.fromLTRB(x * scaleX, y * scaleY, w * scaleX, h * scaleY)
               : Rect.fromLTRB(
                 x * scaleX - (w * scaleX) / 2,
                 y * scaleY - (h * scaleY) / 2,
@@ -817,11 +907,7 @@ class DetectionService {
     return score;
   }
 
-  _YoloBoxFormat _detectYoloBoxFormatRows(
-    List rows,
-    int inputW,
-    int inputH,
-  ) {
+  _YoloBoxFormat _detectYoloBoxFormatRows(List rows, int inputW, int inputH) {
     var xyxyScore = 0;
     var xywhScore = 0;
     final sampleCount = math.min(rows.length, 20);
@@ -853,9 +939,7 @@ class DetectionService {
       final xywhValid = _validBox(left, top, right, bottom, inputW, inputH);
       if (xywhValid) xywhScore++;
     }
-    return xyxyScore >= xywhScore
-        ? _YoloBoxFormat.xyxy
-        : _YoloBoxFormat.xywh;
+    return xyxyScore >= xywhScore ? _YoloBoxFormat.xyxy : _YoloBoxFormat.xywh;
   }
 
   _YoloBoxFormat _detectYoloBoxFormatChannelFirst(
@@ -899,9 +983,7 @@ class DetectionService {
       final xywhValid = _validBox(left, top, right, bottom, inputW, inputH);
       if (xywhValid) xywhScore++;
     }
-    return xyxyScore >= xywhScore
-        ? _YoloBoxFormat.xyxy
-        : _YoloBoxFormat.xywh;
+    return xyxyScore >= xywhScore ? _YoloBoxFormat.xyxy : _YoloBoxFormat.xywh;
   }
 
   bool _validBox(
@@ -1012,6 +1094,128 @@ class DetectionService {
     }
     return value;
   }
+}
+
+class _PreprocessedFrame {
+  const _PreprocessedFrame({required this.letterbox, required this.rgb});
+
+  final _LetterboxInfo letterbox;
+  final Uint8List rgb;
+}
+
+Map<String, Object?> _preprocessFrame(Map<String, Object?> args) {
+  final srcW = args['width'] as int;
+  final srcH = args['height'] as int;
+  final inputW = args['inputW'] as int;
+  final inputH = args['inputH'] as int;
+  final planeCount = args['planeCount'] as int? ?? 0;
+
+  final yBytes =
+      (args['yBytes'] as TransferableTypedData).materialize().asUint8List();
+  final uBytesTtd = args['uBytes'] as TransferableTypedData?;
+  final vBytesTtd = args['vBytes'] as TransferableTypedData?;
+  final uBytes = uBytesTtd?.materialize().asUint8List();
+  final vBytes = vBytesTtd?.materialize().asUint8List();
+  final yRowStride = args['yRowStride'] as int? ?? 0;
+  final uvRowStride = args['uvRowStride'] as int? ?? 0;
+  final uvPixelStride = args['uvPixelStride'] as int? ?? 1;
+
+  final needed = inputW * inputH * 3;
+  final rgb = Uint8List(needed);
+  if (srcW <= 0 || srcH <= 0 || inputW <= 0 || inputH <= 0) {
+    return <String, Object?>{
+      'rgb': TransferableTypedData.fromList([rgb]),
+      'scale': 1.0,
+      'dx': 0.0,
+      'dy': 0.0,
+      'inputW': inputW,
+      'inputH': inputH,
+      'srcW': srcW,
+      'srcH': srcH,
+    };
+  }
+
+  final scale = math.min(inputW / srcW, inputH / srcH);
+  final resizedW = math.min(inputW, math.max(1, (srcW * scale).round()));
+  final resizedH = math.min(inputH, math.max(1, (srcH * scale).round()));
+  final dx = ((inputW - resizedW) / 2).round();
+  final dy = ((inputH - resizedH) / 2).round();
+
+  final xMap = _axisMapLocal(srcSize: srcW, dstSize: resizedW);
+  final yMap = _axisMapLocal(srcSize: srcH, dstSize: resizedH);
+
+  for (var y = 0; y < resizedH; y++) {
+    final srcY = yMap[y];
+    final yRow = yRowStride * srcY;
+    final uvRow = uvRowStride * (srcY >> 1);
+    final dstRow = (y + dy) * inputW * 3;
+    for (var x = 0; x < resizedW; x++) {
+      final srcX = xMap[x];
+      final yValue = yBytes[yRow + srcX];
+      var uValue = 0;
+      var vValue = 0;
+      if (planeCount > 1 && uBytes != null) {
+        final uvIndex = uvRow + (srcX >> 1) * uvPixelStride;
+        if (planeCount == 2) {
+          uValue = uBytes[uvIndex];
+          vValue = uBytes[uvIndex + 1];
+        } else if (vBytes != null) {
+          uValue = uBytes[uvIndex];
+          vValue = vBytes[uvIndex];
+        }
+      }
+
+      final c = yValue - 16;
+      final d = uValue - 128;
+      final e = vValue - 128;
+      var r = (298 * c + 409 * e + 128) >> 8;
+      var g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+      var b = (298 * c + 516 * d + 128) >> 8;
+
+      r = _clampIntLocal(r, 0, 255);
+      g = _clampIntLocal(g, 0, 255);
+      b = _clampIntLocal(b, 0, 255);
+
+      final dstIndex = dstRow + (x + dx) * 3;
+      rgb[dstIndex] = r;
+      rgb[dstIndex + 1] = g;
+      rgb[dstIndex + 2] = b;
+    }
+  }
+
+  return <String, Object?>{
+    'rgb': TransferableTypedData.fromList([rgb]),
+    'scale': scale,
+    'dx': dx.toDouble(),
+    'dy': dy.toDouble(),
+    'inputW': inputW,
+    'inputH': inputH,
+    'srcW': srcW,
+    'srcH': srcH,
+  };
+}
+
+Int32List _axisMapLocal({required int srcSize, required int dstSize}) {
+  if (dstSize <= 0) {
+    return Int32List(0);
+  }
+  final map = Int32List(dstSize);
+  final ratio = srcSize / dstSize;
+  for (var i = 0; i < dstSize; i++) {
+    final v = (i * ratio).round();
+    map[i] = v.clamp(0, srcSize - 1);
+  }
+  return map;
+}
+
+int _clampIntLocal(int value, int min, int max) {
+  if (value < min) {
+    return min;
+  }
+  if (value > max) {
+    return max;
+  }
+  return value;
 }
 
 class _LetterboxInfo {

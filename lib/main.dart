@@ -100,9 +100,15 @@ class CameraHome extends StatefulWidget {
 }
 
 class _CameraHomeState extends State<CameraHome> {
-  static const int _minInferenceIntervalMs = 60;
-  static const int _metricsMaxDim = 360;
-  static const Duration _metricsInterval = Duration(milliseconds: 150);
+  static const bool _enableProfiling = false;
+  static const int _profileEveryN = 30;
+  static const bool _enableVerboseLogs = false;
+  static const bool _useBackgroundPreprocess = true;
+  static const bool _useBackgroundMetrics = true;
+  static const ResolutionPreset _cameraResolution = ResolutionPreset.low;
+  static const int _minInferenceIntervalMs = 100;
+  static const int _metricsMaxDim = 240;
+  static const Duration _metricsInterval = Duration(milliseconds: 250);
   static const Duration _detectionHold = Duration(milliseconds: 250);
   static const double _scoreThreshold = 0.2;
   static const double _nmsThreshold = 0.9;
@@ -129,15 +135,27 @@ class _CameraHomeState extends State<CameraHome> {
   bool _isCapturing = false;
   List<File> _tempImages = const [];
   double? _lastIou;
+  bool _metricsBusy = false;
+  int _profileCount = 0;
   @override
   void initState() {
     super.initState();
-    _metricsService = MetricsService(maxDim: _metricsMaxDim);
+    _metricsService = MetricsService(
+      maxDim: _metricsMaxDim,
+      useBackgroundMeanStdDev: _useBackgroundMetrics,
+      profilingEnabled: _enableProfiling,
+      profilingEveryN: _profileEveryN,
+    );
     _detectionService = DetectionService(
       modelAsset: 'assets/best_float32.tflite',
       scoreThreshold: _scoreThreshold,
       nmsThreshold: _nmsThreshold,
       maxDetections: _maxDetections,
+      enableLogs: false,
+      logEveryN: 30,
+      profilingEnabled: _enableProfiling,
+      profilingEveryN: _profileEveryN,
+      useBackgroundPreprocess: _useBackgroundPreprocess,
     );
     _galleryService = TempGalleryService();
     _iouService = ImageIouService();
@@ -167,7 +185,7 @@ class _CameraHomeState extends State<CameraHome> {
 
     final controller = CameraController(
       camera,
-      ResolutionPreset.medium,
+      _cameraResolution,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420,
     );
@@ -368,18 +386,16 @@ class _CameraHomeState extends State<CameraHome> {
                               decoration: BoxDecoration(
                                 borderRadius: BorderRadius.circular(8),
                                 border: Border.all(
-                                  color: isSelected
-                                      ? Colors.lightGreenAccent
-                                      : Colors.white24,
+                                  color:
+                                      isSelected
+                                          ? Colors.lightGreenAccent
+                                          : Colors.white24,
                                   width: isSelected ? 2 : 1,
                                 ),
                               ),
                               child: ClipRRect(
                                 borderRadius: BorderRadius.circular(7),
-                                child: Image.file(
-                                  file,
-                                  fit: BoxFit.cover,
-                                ),
+                                child: Image.file(file, fit: BoxFit.cover),
                               ),
                             ),
                           );
@@ -391,22 +407,22 @@ class _CameraHomeState extends State<CameraHome> {
                       children: [
                         Expanded(
                           child: OutlinedButton(
-                            onPressed: selected.length == 2 && !busy
-                                ? compare
-                                : null,
+                            onPressed:
+                                selected.length == 2 && !busy ? compare : null,
                             style: OutlinedButton.styleFrom(
                               foregroundColor: Colors.white,
                             ),
-                            child: busy
-                                ? const SizedBox(
-                                    height: 16,
-                                    width: 16,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      color: Colors.white,
-                                    ),
-                                  )
-                                : const Text('So sánh IoU'),
+                            child:
+                                busy
+                                    ? const SizedBox(
+                                      height: 16,
+                                      width: 16,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.white,
+                                      ),
+                                    )
+                                    : const Text('So sánh IoU'),
                           ),
                         ),
                       ],
@@ -468,33 +484,60 @@ class _CameraHomeState extends State<CameraHome> {
       return;
     }
 
-    if (!_detectionService.isBusy &&
-        now.difference(_lastMetrics) >= _metricsInterval) {
+    final shouldProfile = _shouldProfileFrame();
+    final frameSw = shouldProfile ? Stopwatch() : null;
+    frameSw?.start();
+    if (!_metricsBusy && now.difference(_lastMetrics) >= _metricsInterval) {
       _lastMetrics = now;
-      try {
-        final nextMetrics = _metricsService.process(
-          current: _metrics,
-          image: image,
-        );
-        if (mounted) {
-          setState(() {
-            _metrics = nextMetrics;
-          });
-        }
-      } catch (_) {
-        // Ignore metric errors to avoid blocking the preview.
-      }
+      _metricsBusy = true;
+      _processMetrics(image);
     }
     _maybeRunDetection(image, now);
+
+    if (shouldProfile) {
+      frameSw?.stop();
+      debugPrint('[Profile] Frame sync=${frameSw?.elapsedMilliseconds ?? 0}ms');
+    }
+  }
+
+  bool _shouldProfileFrame() {
+    if (!_enableProfiling) return false;
+    _profileCount++;
+    if (_profileEveryN <= 0) {
+      return _profileCount == 1;
+    }
+    return _profileCount % _profileEveryN == 0;
+  }
+
+  Future<void> _processMetrics(CameraImage image) async {
+    try {
+      final nextMetrics =
+          _useBackgroundMetrics
+              ? await _metricsService.processAsync(
+                current: _metrics,
+                image: image,
+              )
+              : _metricsService.process(current: _metrics, image: image);
+      if (mounted) {
+        setState(() {
+          _metrics = nextMetrics;
+        });
+      }
+    } catch (_) {
+      // Ignore metric errors to avoid blocking the preview.
+    } finally {
+      _metricsBusy = false;
+    }
   }
 
   void _maybeRunDetection(CameraImage image, DateTime now) {
     if (!_detectionService.isReady || _detectionService.isBusy) {
       return;
     }
-    final minIntervalMs = _lastInferenceMs <= 0
-        ? _minInferenceIntervalMs
-        : math.max(_minInferenceIntervalMs, _lastInferenceMs);
+    final minIntervalMs =
+        _lastInferenceMs <= 0
+            ? _minInferenceIntervalMs
+            : math.max(_minInferenceIntervalMs, _lastInferenceMs);
     if (now.difference(_lastInference).inMilliseconds < minIntervalMs) {
       return;
     }
@@ -521,12 +564,14 @@ class _CameraHomeState extends State<CameraHome> {
         _lastNonEmptyDetection = start;
         _lastNonEmptyDetections = nextDetections;
         _lastNonEmptyImageSize = nextImageSize;
-        final top = nextDetections.first;
-        debugPrint(
-          'TF detect: ${nextDetections.length} objects. '
-          'Top id=${top.classId}, '
-          'score=${(top.score * 100).toStringAsFixed(1)}%',
-        );
+        if (_enableVerboseLogs) {
+          final top = nextDetections.first;
+          debugPrint(
+            'TF detect: ${nextDetections.length} objects. '
+            'Top id=${top.classId}, '
+            'score=${(top.score * 100).toStringAsFixed(1)}%',
+          );
+        }
       } else if (start.difference(_lastNonEmptyDetection) <= _detectionHold &&
           _lastNonEmptyDetections.isNotEmpty) {
         nextDetections = _lastNonEmptyDetections;
@@ -577,9 +622,10 @@ class _CameraHomeState extends State<CameraHome> {
     final sensorOrientation = controller.description.sensorOrientation;
     final isFront =
         controller.description.lensDirection == CameraLensDirection.front;
-    final rotationDegrees = isFront
-        ? (sensorOrientation + deviceDegrees) % 360
-        : (sensorOrientation - deviceDegrees + 360) % 360;
+    final rotationDegrees =
+        isFront
+            ? (sensorOrientation + deviceDegrees) % 360
+            : (sensorOrientation - deviceDegrees + 360) % 360;
     return (rotationDegrees ~/ 90) % 4;
   }
 
@@ -656,8 +702,7 @@ class _CameraHomeState extends State<CameraHome> {
 
     final rotateOverlay =
         !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
-    final quarterTurns =
-        rotateOverlay ? _overlayQuarterTurns(controller) : 0;
+    final quarterTurns = rotateOverlay ? _overlayQuarterTurns(controller) : 0;
 
     return Material(
       child: Stack(

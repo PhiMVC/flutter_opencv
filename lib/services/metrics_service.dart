@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:ui';
 
@@ -16,6 +17,9 @@ class MetricsService {
     this.maxTiltAngle = 45,
     this.sensorInterval = SensorInterval.gameInterval,
     this.axesSmoothing = 0.35,
+    this.useBackgroundMeanStdDev = false,
+    this.profilingEnabled = false,
+    this.profilingEveryN = 30,
   }) {
     _startSensors();
   }
@@ -25,6 +29,9 @@ class MetricsService {
   final double maxTiltAngle;
   final Duration sensorInterval;
   final double axesSmoothing;
+  final bool useBackgroundMeanStdDev;
+  final bool profilingEnabled;
+  final int profilingEveryN;
 
   Uint8List? _prevLuma;
   StreamSubscription<AccelerometerEvent>? _tiltSubscription;
@@ -44,11 +51,17 @@ class MetricsService {
   static const double _zeroThreshold = 3.0;
   static const double _zeroAlpha = 0.08;
   static const double _minUpProjection = 0.08;
+  int _profileCount = 0;
 
   ValueListenable<Offset> get sensorUpListenable => _sensorUpNotifier;
 
   Metrics process({required Metrics current, required CameraImage image}) {
     _startSensors();
+    final shouldProfile = _shouldProfile();
+    final totalSw = shouldProfile ? Stopwatch() : null;
+    totalSw?.start();
+    final packSw = shouldProfile ? Stopwatch() : null;
+    packSw?.start();
     final yPlane = image.planes[0];
     final packed = _packLumaPlane(
       yPlane.bytes,
@@ -56,32 +69,59 @@ class MetricsService {
       image.height,
       yPlane.bytesPerRow,
     );
+    packSw?.stop();
 
+    final matSw = shouldProfile ? Stopwatch() : null;
+    matSw?.start();
     final mat = cv.Mat.fromList(
       image.height,
       image.width,
       cv.MatType.CV_8UC1,
       packed,
     );
+    matSw?.stop();
     try {
+      final resizeSw = shouldProfile ? Stopwatch() : null;
+      resizeSw?.start();
       final metricsMat = _resizeForMetrics(mat);
+      resizeSw?.stop();
       final ownsMetricsMat = !identical(metricsMat, mat);
       try {
+        final statsSw = shouldProfile ? Stopwatch() : null;
+        statsSw?.start();
         final (mean, stddev) = cv.meanStdDev(metricsMat);
+        statsSw?.stop();
         try {
           final angleDeg = _tiltRollDeg;
           final tiltVerticalDeg = _tiltPitchDeg;
 
+          final shakeSw = shouldProfile ? Stopwatch() : null;
+          shakeSw?.start();
           final shakeRaw = _frameDifference(packed, _prevLuma);
           _updatePrevLuma(packed);
+          shakeSw?.stop();
 
-          return current.withStats(
+          final result = current.withStats(
             mean: mean.val1,
             stddev: stddev.val1,
             angleDeg: angleDeg,
             tiltVerticalDeg: tiltVerticalDeg,
             shakeRaw: shakeRaw,
           );
+
+          if (shouldProfile) {
+            totalSw?.stop();
+            _logProfile(
+              'Profile: pack=${packSw?.elapsedMilliseconds ?? 0}ms '
+              'mat=${matSw?.elapsedMilliseconds ?? 0}ms '
+              'resize=${resizeSw?.elapsedMilliseconds ?? 0}ms '
+              'stats=${statsSw?.elapsedMilliseconds ?? 0}ms '
+              'shake=${shakeSw?.elapsedMilliseconds ?? 0}ms '
+              'total=${totalSw?.elapsedMilliseconds ?? 0}ms',
+            );
+          }
+
+          return result;
         } finally {
           mean.dispose();
           stddev.dispose();
@@ -94,6 +134,73 @@ class MetricsService {
     } finally {
       mat.dispose();
     }
+  }
+
+  Future<Metrics> processAsync({
+    required Metrics current,
+    required CameraImage image,
+  }) async {
+    _startSensors();
+    final shouldProfile = _shouldProfile();
+    final totalSw = shouldProfile ? Stopwatch() : null;
+    totalSw?.start();
+    final packSw = shouldProfile ? Stopwatch() : null;
+    packSw?.start();
+    final yPlane = image.planes[0];
+    final packed = _packLumaPlane(
+      yPlane.bytes,
+      image.width,
+      image.height,
+      yPlane.bytesPerRow,
+    );
+    packSw?.stop();
+
+    final shakeSw = shouldProfile ? Stopwatch() : null;
+    shakeSw?.start();
+    final shakeRaw = _frameDifference(packed, _prevLuma);
+    _updatePrevLuma(packed);
+    shakeSw?.stop();
+
+    final meanSw = shouldProfile ? Stopwatch() : null;
+    final meanStd =
+        useBackgroundMeanStdDev
+            ? await compute(_meanStdDevWorker, <String, Object?>{
+              'bytes': TransferableTypedData.fromList([
+                Uint8List.fromList(packed),
+              ]),
+              'width': image.width,
+              'height': image.height,
+              'maxDim': maxDim,
+            })
+            : _meanStdDevLocal(packed, image.width, image.height);
+    meanSw?.stop();
+
+    final angleDeg = _tiltRollDeg;
+    final tiltVerticalDeg = _tiltPitchDeg;
+
+    final result = current.withStats(
+      mean: (meanStd['mean'] ?? 0).toDouble(),
+      stddev: (meanStd['stddev'] ?? 0).toDouble(),
+      angleDeg: angleDeg,
+      tiltVerticalDeg: tiltVerticalDeg,
+      shakeRaw: shakeRaw,
+    );
+
+    if (shouldProfile) {
+      totalSw?.stop();
+      _logProfile(
+        'Profile(async): pack=${packSw?.elapsedMilliseconds ?? 0}ms '
+        'meanStd=${meanSw?.elapsedMilliseconds ?? 0}ms '
+        'shake=${shakeSw?.elapsedMilliseconds ?? 0}ms '
+        'total=${totalSw?.elapsedMilliseconds ?? 0}ms',
+      );
+    }
+
+    return result;
+  }
+
+  Map<String, double> _meanStdDevLocal(Uint8List bytes, int width, int height) {
+    return _meanStdDevFromBytes(bytes, width, height, maxDim);
   }
 
   void _updatePrevLuma(Uint8List packed) {
@@ -112,6 +219,20 @@ class MetricsService {
     final targetW = math.max(1, (src.width * scale).round());
     final targetH = math.max(1, (src.height * scale).round());
     return cv.resize(src, (targetW, targetH));
+  }
+
+  bool _shouldProfile() {
+    if (!profilingEnabled) return false;
+    _profileCount++;
+    if (profilingEveryN <= 0) {
+      return _profileCount == 1;
+    }
+    return _profileCount % profilingEveryN == 0;
+  }
+
+  void _logProfile(String message) {
+    if (!profilingEnabled) return;
+    debugPrint('[MetricsService] $message');
   }
 
   void dispose() {
@@ -260,4 +381,57 @@ class MetricsService {
     }
     return packed;
   }
+}
+
+Map<String, double> _meanStdDevWorker(Map<String, Object?> args) {
+  final bytes =
+      (args['bytes'] as TransferableTypedData).materialize().asUint8List();
+  final width = args['width'] as int? ?? 0;
+  final height = args['height'] as int? ?? 0;
+  final maxDim = args['maxDim'] as int? ?? 0;
+  return _meanStdDevFromBytes(bytes, width, height, maxDim);
+}
+
+Map<String, double> _meanStdDevFromBytes(
+  Uint8List bytes,
+  int width,
+  int height,
+  int maxDim,
+) {
+  if (width <= 0 || height <= 0 || bytes.isEmpty) {
+    return const {'mean': 0, 'stddev': 0};
+  }
+
+  var targetW = width;
+  var targetH = height;
+  final maxSide = math.max(width, height);
+  if (maxDim > 0 && maxSide > maxDim) {
+    final scale = maxDim / maxSide;
+    targetW = math.max(1, (width * scale).round());
+    targetH = math.max(1, (height * scale).round());
+  }
+
+  final count = targetW * targetH;
+  if (count <= 0) {
+    return const {'mean': 0, 'stddev': 0};
+  }
+
+  double sum = 0;
+  double sumSq = 0;
+  for (var y = 0; y < targetH; y++) {
+    final srcY = ((y * height) / targetH).round().clamp(0, height - 1);
+    final row = srcY * width;
+    for (var x = 0; x < targetW; x++) {
+      final srcX = ((x * width) / targetW).round().clamp(0, width - 1);
+      final value = bytes[row + srcX].toDouble();
+      sum += value;
+      sumSq += value * value;
+    }
+  }
+
+  final mean = sum / count;
+  final variance = (sumSq / count) - (mean * mean);
+  final stddev = math.sqrt(math.max(0, variance));
+
+  return {'mean': mean, 'stddev': stddev};
 }
