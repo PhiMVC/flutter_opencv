@@ -36,11 +36,6 @@ class MetricsPanel extends StatelessWidget {
               isValid: metrics.isTiltVerticalOk,
             ),
             MetricRow(
-              label: 'Thẳng',
-              value: '${metrics.frontal.toStringAsFixed(0)}%',
-              isValid: metrics.isFrontalOk,
-            ),
-            MetricRow(
               label: 'Sáng',
               value: '${metrics.brightness.toStringAsFixed(0)}%',
               isValid: metrics.isBrightnessOk,
@@ -50,16 +45,12 @@ class MetricsPanel extends StatelessWidget {
               value: metrics.shake.toStringAsFixed(2),
               isValid: metrics.isShakeOk,
             ),
-            MetricRow(
-              label: 'Cách',
-              value: '${metrics.distance.toStringAsFixed(2)} m',
-              isValid: metrics.isDistanceOk,
-            ),
           ];
 
-          final firstRow = items.take(4).toList();
-          final secondRow = items.skip(4).toList();
-          while (secondRow.length < 4) {
+          const columns = 3;
+          final firstRow = items.take(columns).toList();
+          final secondRow = items.skip(columns).toList();
+          while (secondRow.length < columns) {
             secondRow.add(const _MetricPlaceholder());
           }
 

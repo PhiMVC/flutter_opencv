@@ -289,10 +289,12 @@ class MetricsService {
     }
 
     // Map gravity to roll/pitch when the phone is held upright (portrait).
-    // Using -ay as the vertical reference keeps 0° when the phone is straight.
-    // Invert roll to match intuitive left/right tilt direction.
-    var rollTarget = -math.atan2(ax, -ay) * 180 / math.pi;
-    var pitchTarget = math.atan2(az, -ay) * 180 / math.pi;
+    // Roll: atan2(Ax, sqrt(Ay^2 + Az^2)) -> left/right tilt.
+    // Pitch: atan2(Az, sqrt(Ax^2 + Ay^2)) -> forward/back tilt.
+    var rollTarget =
+        math.atan2(ax, math.sqrt(ay * ay + az * az)) * 180 / math.pi;
+    var pitchTarget =
+        math.atan2(az, math.sqrt(ax * ax + ay * ay)) * 180 / math.pi;
 
     if (!_calibrated) {
       _calibrationRollSum += rollTarget;
