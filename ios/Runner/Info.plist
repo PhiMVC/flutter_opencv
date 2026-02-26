@@ -49,5 +49,7 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Camera access is required for streaming the preview.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Photo library access is required to add images.</string>
 </dict>
 </plist>
