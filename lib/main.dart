@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'models/detection.dart';
 import 'models/metrics.dart';
 import 'services/detection_service.dart';
+import 'services/image_embedding_service.dart';
 import 'services/image_iou_service.dart';
 import 'services/metrics_service.dart';
 import 'services/temp_gallery_service.dart';
@@ -113,6 +114,9 @@ class _CameraHomeState extends State<CameraHome> {
   static const double _scoreThreshold = 0.2;
   static const double _nmsThreshold = 0.9;
   static const int _maxDetections = 100;
+  static const int _embeddingInputSize = 112;
+  static const double _embeddingThreshold = 0.6;
+  static const EmbeddingMetric _embeddingMetric = EmbeddingMetric.cosine;
 
   CameraController? _controller;
   Metrics _metrics = Metrics.initial();
@@ -123,6 +127,7 @@ class _CameraHomeState extends State<CameraHome> {
   late final DetectionService _detectionService;
   late final TempGalleryService _galleryService;
   late final ImageIouService _iouService;
+  late final ImageEmbeddingService _embeddingService;
   List<Detection> _detections = const [];
   DateTime _lastInference = DateTime.fromMillisecondsSinceEpoch(0);
   int _lastInferenceMs = 0;
@@ -159,6 +164,7 @@ class _CameraHomeState extends State<CameraHome> {
     );
     _galleryService = TempGalleryService();
     _iouService = ImageIouService();
+    _embeddingService = ImageEmbeddingService(targetSize: _embeddingInputSize);
     _loadTempImages();
     _initializeCamera();
     _loadModel();
@@ -285,18 +291,25 @@ class _CameraHomeState extends State<CameraHome> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
       ),
       builder: (context) {
+        var sheetImages = List<File>.from(_tempImages);
         var selected = <File>[];
         double? iou;
-        var busy = false;
+        double? embeddingScore;
+        bool? embeddingSimilar;
+        var iouBusy = false;
+        var embeddingBusy = false;
+        var deleteBusy = false;
+        var deleteMode = false;
+        final deleteSelected = <File>{};
 
         return StatefulBuilder(
           builder: (context, setSheetState) {
-            Future<void> compare() async {
+            Future<void> compareIoU() async {
               if (selected.length != 2) {
                 return;
               }
               setSheetState(() {
-                busy = true;
+                iouBusy = true;
               });
               final result = await _iouService.computeIoU(
                 selected[0],
@@ -306,11 +319,88 @@ class _CameraHomeState extends State<CameraHome> {
                 return;
               }
               setSheetState(() {
-                busy = false;
+                iouBusy = false;
                 iou = result;
               });
               setState(() {
                 _lastIou = result;
+              });
+            }
+
+            Future<void> compareEmbedding() async {
+              if (selected.length != 2) {
+                return;
+              }
+              setSheetState(() {
+                embeddingBusy = true;
+              });
+              final embeddingA = await _embeddingService.computeEmbedding(
+                selected[0],
+              );
+              final embeddingB = await _embeddingService.computeEmbedding(
+                selected[1],
+              );
+              if (!mounted) {
+                return;
+              }
+              if (embeddingA == null || embeddingB == null) {
+                setSheetState(() {
+                  embeddingBusy = false;
+                  embeddingScore = null;
+                  embeddingSimilar = null;
+                });
+                return;
+              }
+              final result = _metricsService.compareEmbeddings(
+                embeddingA: embeddingA,
+                embeddingB: embeddingB,
+                threshold: _embeddingThreshold,
+                metric: _embeddingMetric,
+              );
+              setSheetState(() {
+                embeddingBusy = false;
+                embeddingScore = result.score;
+                embeddingSimilar = result.isSimilar;
+              });
+            }
+
+            Future<void> deleteImages() async {
+              if (deleteSelected.isEmpty) {
+                return;
+              }
+              setSheetState(() {
+                deleteBusy = true;
+              });
+              final toDelete = deleteSelected.toList();
+              await _galleryService.deleteImages(toDelete);
+              if (!mounted) {
+                return;
+              }
+              setSheetState(() {
+                deleteBusy = false;
+                deleteMode = false;
+                deleteSelected.clear();
+                selected.clear();
+                iou = null;
+                embeddingScore = null;
+                embeddingSimilar = null;
+                sheetImages.removeWhere(
+                  (file) => toDelete.any((d) => d.path == file.path),
+                );
+              });
+              await _loadTempImages();
+            }
+
+            void enterDeleteMode(File file) {
+              setSheetState(() {
+                deleteMode = true;
+                deleteSelected
+                  ..clear()
+                  ..add(file);
+                selected.clear();
+                iou = null;
+                embeddingScore = null;
+                embeddingSimilar = null;
               });
             }
 
@@ -332,7 +422,7 @@ class _CameraHomeState extends State<CameraHome> {
                     Row(
                       children: [
                         Text(
-                          'Kho ảnh tạm (${_tempImages.length})',
+                          'Kho ảnh tạm (${sheetImages.length})',
                           style: const TextStyle(
                             color: Colors.white,
                             fontSize: 16,
@@ -340,17 +430,74 @@ class _CameraHomeState extends State<CameraHome> {
                           ),
                         ),
                         const Spacer(),
-                        if (iou != null)
-                          Text(
-                            'IoU ${(iou! * 100).toStringAsFixed(1)}%',
-                            style: const TextStyle(
-                              color: Colors.lightGreenAccent,
-                              fontSize: 14,
-                              fontWeight: FontWeight.w600,
-                            ),
+                        if (deleteMode)
+                          Row(
+                            children: [
+                              TextButton(
+                                onPressed:
+                                    deleteBusy
+                                        ? null
+                                        : () {
+                                          setSheetState(() {
+                                            deleteSelected
+                                              ..clear()
+                                              ..addAll(sheetImages);
+                                          });
+                                        },
+                                child: const Text('Chọn tất cả'),
+                              ),
+                              TextButton(
+                                onPressed:
+                                    deleteBusy
+                                        ? null
+                                        : () {
+                                          setSheetState(() {
+                                            deleteMode = false;
+                                            deleteSelected.clear();
+                                          });
+                                        },
+                                child: const Text('Hủy'),
+                              ),
+                            ],
+                          )
+                        else
+                          Column(
+                            children: [
+                              if (iou != null) ...[
+                                const SizedBox(height: 6),
+                                Text(
+                                  'IoU ${(iou! * 100).toStringAsFixed(1)}%',
+                                  style: const TextStyle(
+                                    color: Colors.lightGreenAccent,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+
+                              if (embeddingScore != null) ...[
+                                const SizedBox(height: 6),
+                                Text(
+                                  _embeddingMetric == EmbeddingMetric.cosine
+                                      ? 'Embedding ${(embeddingScore! * 100).toStringAsFixed(1)}% '
+                                          '${embeddingSimilar == true ? '(giống)' : '(khác)'}'
+                                      : 'Embedding L2 ${embeddingScore!.toStringAsFixed(3)} '
+                                          '${embeddingSimilar == true ? '(giống)' : '(khác)'}',
+                                  style: TextStyle(
+                                    color:
+                                        embeddingSimilar == true
+                                            ? Colors.lightGreenAccent
+                                            : Colors.orangeAccent,
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ],
                           ),
                       ],
                     ),
+
                     const SizedBox(height: 12),
                     SizedBox(
                       height: 320,
@@ -361,26 +508,55 @@ class _CameraHomeState extends State<CameraHome> {
                               crossAxisSpacing: 8,
                               mainAxisSpacing: 8,
                             ),
-                        itemCount: _tempImages.length,
+                        itemCount: sheetImages.length,
                         itemBuilder: (context, index) {
-                          final file = _tempImages[index];
-                          final isSelected = selected.contains(file);
+                          final file = sheetImages[index];
+                          final isSelected =
+                              deleteMode
+                                  ? deleteSelected.contains(file)
+                                  : selected.contains(file);
                           return GestureDetector(
                             onTap: () {
                               setSheetState(() {
-                                if (isSelected) {
-                                  selected.remove(file);
-                                } else {
-                                  if (selected.length < 2) {
-                                    selected.add(file);
+                                if (deleteMode) {
+                                  if (isSelected) {
+                                    deleteSelected.remove(file);
                                   } else {
-                                    selected
-                                      ..removeAt(0)
-                                      ..add(file);
+                                    deleteSelected.add(file);
                                   }
+                                } else {
+                                  if (isSelected) {
+                                    selected.remove(file);
+                                  } else {
+                                    if (selected.length < 2) {
+                                      selected.add(file);
+                                    } else {
+                                      selected
+                                        ..removeAt(0)
+                                        ..add(file);
+                                    }
+                                  }
+                                  iou = null;
+                                  embeddingScore = null;
+                                  embeddingSimilar = null;
                                 }
-                                iou = null;
                               });
+                            },
+                            onLongPress: () {
+                              if (deleteBusy) {
+                                return;
+                              }
+                              if (!deleteMode) {
+                                enterDeleteMode(file);
+                              } else {
+                                setSheetState(() {
+                                  if (isSelected) {
+                                    deleteSelected.remove(file);
+                                  } else {
+                                    deleteSelected.add(file);
+                                  }
+                                });
+                              }
                             },
                             child: Container(
                               decoration: BoxDecoration(
@@ -388,7 +564,9 @@ class _CameraHomeState extends State<CameraHome> {
                                 border: Border.all(
                                   color:
                                       isSelected
-                                          ? Colors.lightGreenAccent
+                                          ? (deleteMode
+                                              ? Colors.redAccent
+                                              : Colors.lightGreenAccent)
                                           : Colors.white24,
                                   width: isSelected ? 2 : 1,
                                 ),
@@ -405,26 +583,92 @@ class _CameraHomeState extends State<CameraHome> {
                     const SizedBox(height: 12),
                     Row(
                       children: [
-                        Expanded(
-                          child: OutlinedButton(
-                            onPressed:
-                                selected.length == 2 && !busy ? compare : null,
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: Colors.white,
-                            ),
-                            child:
-                                busy
-                                    ? const SizedBox(
-                                      height: 16,
-                                      width: 16,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                        color: Colors.white,
+                        if (deleteMode) ...[
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed:
+                                  deleteSelected.isNotEmpty && !deleteBusy
+                                      ? deleteImages
+                                      : null,
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                alignment: Alignment.center,
+                              ),
+                              child:
+                                  deleteBusy
+                                      ? const SizedBox(
+                                        height: 16,
+                                        width: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: Colors.white,
+                                        ),
+                                      )
+                                      : Text(
+                                        'Xóa ảnh (${deleteSelected.length})',
+                                        textAlign: TextAlign.center,
                                       ),
-                                    )
-                                    : const Text('So sánh IoU'),
+                            ),
                           ),
-                        ),
+                        ] else ...[
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed:
+                                  selected.length == 2 &&
+                                          !iouBusy &&
+                                          !embeddingBusy
+                                      ? compareIoU
+                                      : null,
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                alignment: Alignment.center,
+                              ),
+                              child:
+                                  iouBusy
+                                      ? const SizedBox(
+                                        height: 16,
+                                        width: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: Colors.white,
+                                        ),
+                                      )
+                                      : const Text(
+                                        'So sánh IoU',
+                                        textAlign: TextAlign.center,
+                                      ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed:
+                                  selected.length == 2 &&
+                                          !iouBusy &&
+                                          !embeddingBusy
+                                      ? compareEmbedding
+                                      : null,
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                alignment: Alignment.center,
+                              ),
+                              child:
+                                  embeddingBusy
+                                      ? const SizedBox(
+                                        height: 16,
+                                        width: 16,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: Colors.white,
+                                        ),
+                                      )
+                                      : const Text(
+                                        'So sánh embedding',
+                                        textAlign: TextAlign.center,
+                                      ),
+                            ),
+                          ),
+                        ],
                       ],
                     ),
                   ],

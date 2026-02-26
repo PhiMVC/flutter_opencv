@@ -42,4 +42,19 @@ class TempGalleryService {
     });
     return files;
   }
+
+  Future<int> deleteImages(Iterable<File> files) async {
+    var deleted = 0;
+    for (final file in files) {
+      try {
+        if (await file.exists()) {
+          await file.delete();
+          deleted++;
+        }
+      } catch (_) {
+        // Ignore delete errors.
+      }
+    }
+    return deleted;
+  }
 }

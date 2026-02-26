@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:isolate';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:camera/camera.dart';
@@ -9,6 +10,15 @@ import 'package:opencv_dart/opencv_dart.dart' as cv;
 import 'package:sensors_plus/sensors_plus.dart';
 
 import '../models/metrics.dart';
+
+enum EmbeddingMetric { cosine, l2Distance }
+
+class EmbeddingCompareResult {
+  const EmbeddingCompareResult({required this.score, required this.isSimilar});
+
+  final double score;
+  final bool isSimilar;
+}
 
 class MetricsService {
   MetricsService({
@@ -197,6 +207,79 @@ class MetricsService {
     }
 
     return result;
+  }
+
+  /// Compare two embeddings using cosine similarity or L2 distance.
+  /// So sánh hai embedding bằng cosine similarity hoặc L2 distance.
+  ///
+  /// If [normalize] is false, the embeddings are assumed to be L2-normalized.
+  /// Nếu [normalize] = false thì giả sử embedding đã được L2-normalize sẵn.
+  ///
+  /// Cosine: score >= threshold -> similar. L2: score <= threshold -> similar.
+  /// Cosine: score >= threshold -> giống. L2: score <= threshold -> giống.
+  EmbeddingCompareResult compareEmbeddings({
+    required Float32List embeddingA,
+    required Float32List embeddingB,
+    required double threshold,
+    EmbeddingMetric metric = EmbeddingMetric.cosine,
+    bool normalize = true,
+  }) {
+    if (embeddingA.isEmpty ||
+        embeddingB.isEmpty ||
+        embeddingA.length != embeddingB.length) {
+      return EmbeddingCompareResult(
+        score: metric == EmbeddingMetric.cosine ? 0.0 : double.infinity,
+        isSimilar: false,
+      );
+    }
+
+    final a = normalize ? _l2Normalize(embeddingA) : embeddingA;
+    final b = normalize ? _l2Normalize(embeddingB) : embeddingB;
+
+    final score =
+        metric == EmbeddingMetric.cosine
+            ? _cosineSimilarity(a, b)
+            : _l2Distance(a, b);
+
+    final isSimilar =
+        metric == EmbeddingMetric.cosine
+            ? score >= threshold
+            : score <= threshold;
+
+    return EmbeddingCompareResult(score: score, isSimilar: isSimilar);
+  }
+
+  Float32List _l2Normalize(Float32List v) {
+    double sum = 0;
+    for (final x in v) {
+      sum += x * x;
+    }
+    final norm = math.sqrt(sum);
+    if (norm == 0) {
+      return v;
+    }
+    final out = Float32List(v.length);
+    for (int i = 0; i < v.length; i++) {
+      out[i] = (v[i] / norm).toDouble();
+    }
+    return out;
+  }
+
+  double _cosineSimilarity(Float32List a, Float32List b) {
+    double dot = 0;
+    for (int i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+    }
+    return dot; // if normalized, cosine = dot
+  }
+
+  double _l2Distance(Float32List a, Float32List b) {
+    double sum = 0;
+    for (int i = 0; i < a.length; i++) {
+      final d = a[i] - b[i];
+      sum += d * d;
+    }
+    return math.sqrt(sum);
   }
 
   Map<String, double> _meanStdDevLocal(Uint8List bytes, int width, int height) {
