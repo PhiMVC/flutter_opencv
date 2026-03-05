@@ -41,6 +41,11 @@ class MetricsPanel extends StatelessWidget {
               isValid: metrics.isBrightnessOk,
             ),
             MetricRow(
+              label: 'Tối',
+              value: '${metrics.darkness.toStringAsFixed(0)}%',
+              isValid: metrics.isDarknessOk,
+            ),
+            MetricRow(
               label: 'Rung',
               value: metrics.shake.toStringAsFixed(2),
               isValid: metrics.isShakeOk,

@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:isolate';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:camera/camera.dart';
@@ -102,6 +101,7 @@ class MetricsService {
         final (mean, stddev) = cv.meanStdDev(metricsMat);
         statsSw?.stop();
         try {
+          final darknessPercent = _lumaToDarknessPercent(mean.val1);
           final angleDeg = _tiltRollDeg;
           final tiltVerticalDeg = _tiltPitchDeg;
 
@@ -117,6 +117,7 @@ class MetricsService {
             angleDeg: angleDeg,
             tiltVerticalDeg: tiltVerticalDeg,
             shakeRaw: shakeRaw,
+            darknessPercent: darknessPercent,
           );
 
           if (shouldProfile) {
@@ -187,13 +188,16 @@ class MetricsService {
 
     final angleDeg = _tiltRollDeg;
     final tiltVerticalDeg = _tiltPitchDeg;
+    final meanValue = (meanStd['mean'] ?? 0).toDouble();
+    final darknessPercent = _lumaToDarknessPercent(meanValue);
 
     final result = current.withStats(
-      mean: (meanStd['mean'] ?? 0).toDouble(),
+      mean: meanValue,
       stddev: (meanStd['stddev'] ?? 0).toDouble(),
       angleDeg: angleDeg,
       tiltVerticalDeg: tiltVerticalDeg,
       shakeRaw: shakeRaw,
+      darknessPercent: darknessPercent,
     );
 
     if (shouldProfile) {
@@ -423,6 +427,11 @@ class MetricsService {
       return 0;
     }
     return sum / count;
+  }
+
+  double _lumaToDarknessPercent(double meanLuma) {
+    final clampedLuma = _clamp(meanLuma, 0, 255);
+    return (1 - (clampedLuma / 255)) * 100;
   }
 
   double _smooth(double current, double target, double alpha) {
